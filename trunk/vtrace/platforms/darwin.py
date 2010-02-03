@@ -9,33 +9,14 @@ import vtrace
 import vtrace.platforms.posix as v_posix
 import vtrace.symbase as symbase
 
-class MachoSymbolResolver(symbase.VSymbolResolver):
-    pass
-
 class MachoMixin:
-    def platformGetSymbolResolver(self, filename, baseaddr):
-        return MachoSymbolResolver(filename, baseaddr)
+    def platformParseBinary(self, filename, baseaddr, normname):
+        pass
 
 class DarwinMixin:
 
     def initMixin(self):
         self.tdict = {}
-
-    def platformContinue(self):
-        cmd = v_posix.PT_CONTINUE
-        if self.getMode("Syscall", False):
-            cmd = PT_SYSCALL
-        pid = self.getPid()
-        sig = self.getMeta("PendingSignal", 0)
-        # Only deliver signals to the main thread
-        if v_posix.ptrace(cmd, pid, 0, sig) != 0:
-            raise Exception("ERROR ptrace failed for tid %d" % pid)
-
-        for tid in self.pthreads:
-            if tid == pid:
-                continue
-            if v_posix.ptrace(cmd, tid, 0, 0) != 0:
-                pass
 
     def platformExec(self, cmdline):
         import mach
@@ -131,7 +112,7 @@ class DarwinMixin:
             regbuf = thread.get_state(self.thread_state) + thread.get_state(self.debug_state)
             regdict = self.unpackRegisters(regbuf)
             sp = regdict.get(spname, 0)
-            mapbase,maplen,mperm,mfile = self.getMap(sp)
+            mapbase,maplen,mperm,mfile = self.getMemoryMap(sp)
             tid = mapbase + maplen # The TOP of the stack, so it doesn't grow down and change
             ret[tid] = tid
             self.tdict[tid] = thread

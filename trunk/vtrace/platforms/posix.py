@@ -8,12 +8,16 @@ import struct
 import signal
 import platform
 
+
 import vtrace
-import vtrace.symbase as symbase
 import vtrace.util as v_util
 import Elf
 from ctypes import *
 import ctypes.util as cutil
+
+import envi.resolver as e_resolv
+import envi.memory as e_mem
+import envi.cli as e_cli
 
 
 libc = None
@@ -25,7 +29,7 @@ class PosixMixin:
     things like wait()
     """
 
-    def initMixin(self):
+    def __init__(self):
         """
         Setup for the fact that we support signal driven
         debugging on posix platforms
@@ -53,11 +57,11 @@ class PosixMixin:
         # GHETTO: just look for magic based on binary
         magix = ["\x7fELF",]
         done = []
-        for addr,size,perms,fname in self.getMaps():
+        for addr,size,perms,fname in self.getMemoryMaps():
             if fname in done:
                 continue
             done.append(fname)
-            if perms & vtrace.MM_READ:
+            if perms & e_mem.MM_READ:
                 try:
                     buf = self.readMemory(addr, 20)
                     for m in magix:
@@ -76,6 +80,7 @@ class PosixMixin:
         self.posixLibraryLoadHack()
         # We'll emulate windows here and send an additional
         # break after our library load events to make things easy
+        self.runAgain(False) # Clear this, if they want BREAK to run, it will
         self.fireNotifiers(vtrace.NOTIFY_BREAK)
 
     def platformProcessEvent(self, status):
@@ -114,8 +119,12 @@ class PosixMixin:
 
             # Traps on posix systems are a little complicated
             if self.stepping:
+                #FIXME try out was single step thing for intel
                 self.stepping = False
                 self.fireNotifiers(vtrace.NOTIFY_STEP)
+
+            elif self.checkWatchpoints():
+                return
 
             elif self.checkBreakpoints():
                 # It was either a known BP or a sendBreak()
@@ -136,16 +145,21 @@ class PosixMixin:
             self.setMeta("PendingSignal", sig)
             self.fireNotifiers(vtrace.NOTIFY_SIGNAL)
 
-class ElfSymbolResolver(symbase.VSymbolResolver):
-    def parseBinary(self):
+
+class ElfMixin:
+    """
+    A platform mixin to parse Elf binaries
+    """
+    def __init__(self):
+        self.setMeta('Format','elf')
+
+    def platformParseBinary(self, filename, baseaddr, normname):
         typemap = {
-            Elf.STT_FUNC:vtrace.SYM_FUNCTION,
-            Elf.STT_SECTION:vtrace.SYM_SECTION,
-            Elf.STT_OBJECT:vtrace.SYM_GLOBAL
+            Elf.STT_FUNC:e_resolv.FunctionSymbol,
+            Elf.STT_SECTION:e_resolv.SectionSymbol,
         }
 
-        elf = Elf.Elf(self.filename)
-        base = self.loadbase
+        elf = Elf.Elf(filename)
 
         # Quick pass to see if we need to assume prelink
         for sec in elf.sections:
@@ -153,26 +167,22 @@ class ElfSymbolResolver(symbase.VSymbolResolver):
                 continue
             # Try to detect prelinked
             if sec.sh_addr != sec.sh_offset:
-                base = 0
+                baseaddr = 0
             break
 
         for sec in elf.sections:
-            self.addSymbol(sec.name, sec.sh_addr+base, sec.sh_size, vtrace.SYM_SECTION)
+            sym = e_resolv.SectionSymbol(sec.name, sec.sh_addr+baseaddr, sec.sh_size, normname)
+            self.addSymbol(sym)
 
         for sym in elf.symbols:
-            self.addSymbol(sym.name, sym.st_value+base, sym.st_size, typemap.get((sym.st_info & 0xf),vtrace.SYM_MISC) )
+            symclass = typemap.get((sym.st_info & 0xf), e_resolv.Symbol)
+            sym = symclass(sym.name, sym.st_value+baseaddr, sym.st_size, normname)
+            self.addSymbol(sym)
 
         for sym in elf.dynamic_symbols:
-            self.addSymbol(sym.name, sym.st_value+base, sym.st_size, typemap.get((sym.st_info & 0xf),vtrace.SYM_MISC) )
-
-
-class ElfMixin:
-    """
-    A platform mixin to parse Elf binaries
-    """
-    def platformGetSymbolResolver(self, filename, baseaddr):
-        return ElfSymbolResolver(filename, baseaddr)
-
+            symclass = typemap.get((sym.st_info & 0xf), e_resolv.Symbol)
+            sym = symclass(sym.name, sym.st_value+baseaddr, sym.st_size, normname)
+            self.addSymbol(sym)
 
 # As much as I would *love* if all the ptrace defines were the same all the time,
 # there seem to be small platform differences...
@@ -210,7 +220,8 @@ def ptrace(code, pid, addr, data):
         if not cloc:
             raise Exception("ERROR: can't find C library on posix system!")
         libc = CDLL(cloc)
-    return libc.ptrace(code, pid, addr, data)
+        libc.ptrace.argtypes = [c_int, c_uint32, c_char_p, c_int]
+    return libc.ptrace(code, pid, c_char_p(addr), data)
 
 #def waitpid(pid, status, options):
     #global libc
@@ -233,7 +244,7 @@ class PtraceMixin:
     exist... but the darwin mixin over-rides platformGetRegs)
     """
 
-    def initMixin(self):
+    def __init__(self):
         """
         Setup supported modes
         """
@@ -243,8 +254,8 @@ class PtraceMixin:
             self.conthack = 1
 
         # Make a worker thread do these for us...
-        self.threadWrap("platformGetRegs", self.platformGetRegs)
-        self.threadWrap("platformSetRegs", self.platformSetRegs)
+        self.threadWrap("platformGetRegCtx", self.platformGetRegCtx)
+        self.threadWrap("platformSetRegCtx", self.platformSetRegCtx)
         self.threadWrap("platformAttach", self.platformAttach)
         self.threadWrap("platformDetach", self.platformDetach)
         self.threadWrap("platformStepi", self.platformStepi)
@@ -254,7 +265,7 @@ class PtraceMixin:
 
     def platformExec(self, cmdline):
         self.execing = True
-        cmdlist = v_util.splitargs(cmdline)
+        cmdlist = e_cli.splitargs(cmdline)
         os.stat(cmdlist[0])
         pid = os.fork()
         if pid == 0:

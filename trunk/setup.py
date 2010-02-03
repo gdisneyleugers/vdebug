@@ -5,13 +5,22 @@ from distutils.core import setup, Extension
 # /opt/local/Library/Frameworks/Python.framework/Versions/2.4/bin/epydoc --html -o docs -c docs/epydoc.css vtrace
 
 packages = [
-    'vtrace','vtrace.platforms','vtrace.archs','vtrace.tools',
-    'envi','envi.disassemblers','envi.disassemblers.libdisassemble',
-    'cobra',
-    'Elf',
-    'vstruct',
-    'vwidget',
-    'vdb','vdb.extensions','vdb.gui','vdb.gui.extensions',
+    "cobra",
+    "Elf",
+    "envi",
+    "envi.disassemblers",
+    "envi.disassemblers.libdisassemble",
+    "PE",
+    "vdb",
+    "vdb.extensions",
+    "vdb.gui",
+    "vdb.gui.extensions",
+    "vstruct",
+    "vtrace",
+    "vtrace.archs",
+    "vtrace.platforms",
+    "vtrace.tools",
+    "vwidget",
 ]
 
 mods = []

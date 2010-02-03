@@ -6,18 +6,558 @@ import os
 import struct
 import vtrace
 import traceback
-import inspect
 import platform
+
 from Queue import Queue
 from threading import Thread,currentThread,Lock
-import traceback
 
-class BasePlatformMixin:
-    """
-    Mixin for all the platformDoFoo functions that throws an
-    exception so you know your platform doesn't implement it.
-    """
+import envi
+import envi.resolver as e_resolv
+import envi.memory as e_mem
 
+class TracerBase(vtrace.Notifier):
+    """
+    The basis for a tracer's internals.  All platformFoo/archFoo
+    functions are defaulted, and internal state is initialized.
+    Additionally, a number of internal utilities are housed here.
+    """
+    def __init__(self):
+        """
+        The routine to initialize a tracer's initial internal state.  This
+        is used by the initial creation routines, AND on attaches/executes
+        to re-fresh the state of the tracer.
+        WARNING: This will erase all metadata/symbols (modes/notifiers are kept)
+        """
+        vtrace.Notifier.__init__(self)
+
+        self.pid = 0 # Attached pid (also used to know if attached)
+        self.exited = False
+        self.breakpoints = {}
+        self.bpbyid = {}
+        self.bpid = 0
+        self.curbp = None
+        self.bplock = Lock()
+        self.deferred = []
+        self.running = False
+        self.runagain = False
+        self.attached = False
+        # A cache for memory maps and fd listings
+        self.mapcache = None
+        self.threadcache = None
+        self.fds = None
+        self.signal_ignores = []
+        self.localvars = {}
+
+        # Track which libraries are parsed, and their
+        # normame to full path mappings
+        self.libloaded = {} # True if the library has been loaded already
+        self.libpaths = {}  # normname->filename and filename->normname lookup
+
+        # For all transient data (if notifiers want
+        # to track stuff per-trace
+        self.metadata = {}
+
+        # Set up some globally expected metadata
+        self.setMeta("PendingSignal", 0)
+        self.setMeta("IgnoredSignals",[])
+        self.setMeta("LibraryBases", {}) # name -> base address mappings for binaries
+        self.setMeta("LibraryPaths", {}) # base -> path mappings for binaries
+        self.setMeta("ThreadId", -1) # If you *can* have a thread id put it here
+        arch = envi.getCurrentArch()
+        plat = platform.system()
+        rel  = platform.release()
+        self.setMeta("Architecture", arch)
+        self.setMeta("Platform", plat)
+        self.setMeta("Release", rel)
+
+        # Use this if we are *expecting* a break
+        # which is caused by us (so we remove the
+        # SIGBREAK from pending_signal
+        self.setMeta("ShouldBreak", False)
+
+    def nextBpId(self):
+        self.bplock.acquire()
+        x = self.bpid
+        self.bpid += 1
+        self.bplock.release()
+        return x
+
+    def justAttached(self, pid):
+        """
+        platformAttach() function should call this
+        immediately after a successful attach.  This does
+        any necessary initialization for a tracer to be
+        back in a clean state.
+        """
+        self.pid = pid
+        self.attached = True
+        self.breakpoints = {}
+        self.bpbyid = {}
+        self.setMeta("PendingSignal", 0)
+        self.setMeta("PendingException", None)
+        self.setMeta("ExitCode", 0)
+        self.exited = False
+
+    def getResolverForFile(self, filename):
+        res = self.resbynorm.get(filename, None)
+        if res: return res
+        res = self.resbyfile.get(filename, None)
+        if res: return res
+        return None
+
+    def steploop(self):
+        """
+        Continue stepi'ing in a loop until shouldRunAgain()
+        returns false (like RunForever mode or something)
+        """
+        if self.getMode("NonBlocking", False):
+            thr = Thread(target=self.doStepLoop)
+            thr.setDaemon(True)
+            thr.start()
+        else:
+            self.doStepLoop()
+
+    def doStepLoop(self):
+        go = True
+        while go:
+            self.stepi()
+            go = self.shouldRunAgain()
+
+    def _doRun(self):
+        # Exists to avoid recursion from loop in doWait
+        self.requireAttached()
+        self.requireNotRunning()
+        self.requireNotExited()
+
+        self.fireNotifiers(vtrace.NOTIFY_CONTINUE)
+
+        # Step past a breakpoint if we are on one.
+        self._checkForBreak()
+        # Throw down and activate breakpoints...
+        self._throwdownBreaks()
+
+        self.running = True
+        # Syncregs must happen *after* notifiers for CONTINUE
+        # and checkForBreak.
+        self._syncRegs()
+        self.platformContinue()
+        self.setMeta("PendingSignal", 0)
+
+    def wait(self):
+        """
+        Wait for the trace target to have
+        something happen...   If the trace is in
+        NonBlocking mode, this will fire a thread
+        to wait for you and return control immediately.
+        """
+        if self.getMode("NonBlocking"):
+            thr = Thread(target=self._doWait)
+            thr.setDaemon(True)
+            thr.start()
+        else:
+            self._doWait()
+
+    def _doWait(self):
+        doit = True
+        while doit:
+        # A wrapper method for  wait() and the wait thread to use
+            event = self.platformWait()
+            self.running = False
+            self.platformProcessEvent(event)
+            doit = self.shouldRunAgain()
+            if doit:
+                self._doRun()
+
+    def _throwdownBreaks(self):
+        """
+        Run through the breakpoints and setup
+        the ones that are enabled.
+        """
+        self.curbp = None
+        if self.getMode("FastBreak"):
+            if self.fb_bp_done:
+                return
+
+        # Resolve deferred breaks
+        for bp in self.deferred:
+            addr = bp.resolveAddress(self)
+            if addr != None:
+                self.deferred.remove(bp)
+                self.breakpoints[addr] = bp
+
+        for bp in self.breakpoints.values():
+            if bp.isEnabled():
+                try:
+                    bp.activate(self)
+                except Exception, e:
+                    traceback.print_exc()
+                    print "WARNING: bpid %d activate failed (deferring): %s" % (bp.id, e)
+                    self.deferred.append(bp)
+
+        if self.getMode("FastBreak"):
+            self.fb_bp_done = True
+
+    def _syncRegs(self):
+        """
+        Sync the reg-cache into the target process
+        """
+        if self.regcache != None:
+            for tid, ctx in self.regcache.items():
+                if ctx.isDirty():
+                    self.platformSetRegCtx(tid, ctx)
+        self.regcache = None
+
+    def _cacheRegs(self, threadid):
+        """
+        Make sure the reg-cache is populated
+        """
+        if self.regcache == None:
+            self.regcache = {}
+        ret = self.regcache.get(threadid)
+        if ret == None:
+            ret = self.platformGetRegCtx(threadid)
+            self.regcache[threadid] = ret
+        return ret
+
+    def _checkForBreak(self):
+        """
+        Check to see if we've landed on a breakpoint, and if so
+        deactivate and step us past it.
+
+        WARNING: Unfortunatly, cause this is used immidiatly before
+        a call to run/wait, we must block briefly even for the GUI
+        """
+        # Steal a reference because the step should
+        # clear curbp...
+        bp = self.curbp
+        if bp != None and bp.isEnabled():
+            bp.deactivate(self)
+            orig = self.getMode("FastStep")
+            self.setMode("FastStep", True)
+            self.stepi()
+            self.setMode("FastStep", orig)
+            bp.activate(self)
+
+    def shouldRunAgain(self):
+        """
+        A unified place for the test as to weather this trace
+        should be told to run again after reaching some stopping
+        condition.
+        """
+        if not self.attached:
+            return False
+
+        if self.exited:
+            return False
+
+        if self.getMode("RunForever"):
+            return True
+
+        if self.runagain:
+            return True
+
+        return False
+
+    def __repr__(self):
+        run = "stopped"
+        exe = "None"
+        if self.isRunning():
+            run = "running"
+        elif self.exited:
+            run = "exited"
+        exe = self.getMeta("ExeName")
+        return "[%d]\t- %s <%s>" % (self.pid, exe, run)
+
+    def initMode(self, name, value, descr):
+        """
+        Initialize a mode, this should ONLY be called
+        during setup routines for the trace!  It determines
+        the available mode setings.
+        """
+        self.modes[name] = bool(value)
+        self.modedocs[name] = descr
+
+    def release(self):
+        """
+        Do cleanup when we're done.  This is mostly necissary
+        because of the thread proxy holding a reference to this
+        tracer...  We need to let him die off and try to get
+        garbage collected.
+        """
+        if self.thread:
+            self.thread.go = False
+
+    def __del__(self):
+        if self.attached:
+            self.detach()
+
+        if self.thread:
+            self.thread.go = False
+
+
+    def fireTracerThread(self):
+        self.thread = TracerThread()
+
+    def fireNotifiers(self, event):
+        """
+        Fire the registered notifiers for the NOTIFY_* event.
+        """
+        if currentThread().__class__ == TracerThread:
+            raise Exception("ERROR: you can't fireNotifiers from *inside* the TracerThread")
+
+        # Skip out on notifiers for NOTIFY_BREAK when in
+        # FastBreak mode
+        if self.getMode("FastBreak", False) and event == vtrace.NOTIFY_BREAK:
+            return
+
+        if self.getMode("FastStep", False) and event == vtrace.NOTIFY_STEP:
+            return
+
+        if event == vtrace.NOTIFY_SIGNAL:
+            win32 = self.getMeta("Win32Event", None)
+            if win32:
+                code = win32["ExceptionCode"]
+            else:
+                code = self.getMeta("PendingSignal", 0)
+
+            if code in self.getMeta("IgnoredSignals", []):
+                if vtrace.verbose: print "Ignoring",code
+                self.runAgain()
+                return
+
+        alllist = self.getNotifiers(vtrace.NOTIFY_ALL)
+        nlist = self.getNotifiers(event)
+
+        trace = self
+        # if the trace has a proxy it's notifiers
+        # need that, cause we can't be pickled ;)
+        if self.proxy:
+            trace = self.proxy
+
+        # The "NOTIFY_ALL" guys get priority
+        for notifier in alllist:
+            try:
+                if notifier == self:
+                    notifier.handleEvent(event,self)
+                else:
+                    notifier.handleEvent(event,trace)
+            except:
+                print "WARNING: Notifier exception for",repr(notifier)
+                traceback.print_exc()
+
+        for notifier in nlist:
+            try:
+                if notifier == self:
+                    notifier.handleEvent(event,self)
+                else:
+                    notifier.handleEvent(event,trace)
+            except:
+                print "WARNING: Notifier exception for",repr(notifier)
+                traceback.print_exc()
+
+    def _cleanupBreakpoints(self):
+        self.fb_bp_done = False
+        for bp in self.breakpoints.itervalues():
+            # No harm in calling deactivate on
+            # an inactive bp
+            bp.deactivate(self)
+
+    def _fireBreakpoint(self, bp):
+        self.curbp = bp
+        try:
+            bp.notify(vtrace.NOTIFY_BREAK, self)
+        except Exception, msg:
+            print "Breakpoint Exception 0x%.8x : %s" % (bp.address,msg)
+        self.fireNotifiers(vtrace.NOTIFY_BREAK)
+
+    def checkPageWatchpoints(self):
+        """
+        Check if the given memory fault was part of a valid
+        MapWatchpoint.
+        """
+        faultaddr = self.platformGetMemFault()
+
+        #FIXME this is some AWESOME but intel specific nonsense
+        if faultaddr == None: return False
+        faultpage = faultaddr & 0xfffff000
+
+        wp = self.breakpoints.get(faultpage, None)
+        if wp == None:
+            return False
+
+        self._fireBreakpoint(wp)
+        return True
+
+    def checkWatchpoints(self):
+        # Check for hardware watchpoints
+        waddr = self.archCheckWatchpoints()
+        if waddr != None:
+            wp = self.breakpoints.get(waddr, None)
+            self._fireBreakpoint(wp)
+            return True
+
+    def checkBreakpoints(self):
+        """
+        This is mostly for systems (like linux) where you can't tell
+        the difference between some SIGSTOP/SIGBREAK conditions and
+        an actual breakpoint instruction.
+        This method will return true if either the breakpoint
+        subsystem or the sendBreak (via ShouldBreak meta) is true
+        """
+        pc = self.getProgramCounter()
+        bi = self.archGetBreakInstr()
+        bl = pc - len(bi)
+        bp = self.breakpoints.get(bl, None)
+
+        if bp:
+            addr = bp.getAddress()
+            # Step back one instruction to account break
+            self.setProgramCounter(addr)
+            self._fireBreakpoint(bp)
+            return True
+
+        if self.getMeta("ShouldBreak"):
+            self.setMeta("ShouldBreak", False)
+            self.fireNotifiers(vtrace.NOTIFY_BREAK)
+            return True
+
+        return False
+
+    def notify(self, event, trace):
+        """
+        We are frequently a notifier for ourselves, so we can do things
+        like handle events on attach and on break in a unified fashion.
+        """
+        self.threadcache = None
+        self.mapcache = None
+        self.fds = None
+        self.running = False
+
+        if event in self.auto_continue:
+            self.runAgain()
+
+        # For thread exits, make sure the tid
+        # isn't in 
+        if event == vtrace.NOTIFY_EXIT_THREAD:
+            tid = self.getMeta("ThreadId")
+            self.sus_threads.pop(tid, None)
+
+        # Do the stuff we do for detach/exit or
+        # cleanup breaks etc...
+        if event == vtrace.NOTIFY_ATTACH:
+            pass
+
+        elif event == vtrace.NOTIFY_DETACH:
+            for tid in self.sus_threads.keys():
+                self.resumeThread(tid)
+            self._cleanupBreakpoints()
+
+        elif event == vtrace.NOTIFY_EXIT:
+            self.setMode("RunForever", False)
+            self.exited = True
+            self.attached = False
+
+        elif event == vtrace.NOTIFY_CONTINUE:
+            self.runagain = False
+
+        else:
+            # Any of the events in this pool mean we're
+            # stopping but still attached.
+            if not self.getMode("FastBreak"):
+                self._cleanupBreakpoints()
+
+    def delLibraryBase(self, baseaddr):
+
+        libname = self.getMeta("LibraryPaths").get(baseaddr, "unknown")
+        normname = self.normFileName(libname)
+
+        sym = self.getSymByName(normname)
+
+        self.setMeta("LatestLibrary", libname)
+        self.setMeta("LatestLibraryNorm", normname)
+
+        self.fireNotifiers(vtrace.NOTIFY_UNLOAD_LIBRARY)
+
+        self.getMeta("LibraryBases").pop(normname, None)
+        self.getMeta("LibraryPaths").pop(baseaddr, None)
+        if sym != None:
+            self.delSymbol(sym)
+
+    def addLibraryBase(self, libname, address):
+        """
+        This should be used *at load time* to setup the library
+        event metadata.
+
+        This *must* be called from a context where it's safe to
+        fire notifiers, because it will fire a notifier to alert
+        about a LOAD_LIBRARY. (This means *not* from inside another
+        notifer)
+        """
+
+        self.setMeta("LatestLibrary", None)
+        self.setMeta("LatestLibraryNorm", None)
+
+        normname = self.normFileName(libname)
+        if self.getSymByName(normname) != None:
+            normname = "%s_%.8x" % (normname,address)
+
+        # Only actually do library work
+        if os.path.exists(libname):
+
+            self.getMeta("LibraryPaths")[address] = libname
+            self.getMeta("LibraryBases")[normname] = address
+            self.setMeta("LatestLibrary", libname)
+            self.setMeta("LatestLibraryNorm", normname)
+
+            width = self.arch.getPointerSize()
+            sym = e_resolv.FileSymbol(normname, address, 0, width=width)
+            sym.casesens = self.casesens
+            self.addSymbol(sym)
+
+            self.libpaths[normname] = libname
+
+        self.fireNotifiers(vtrace.NOTIFY_LOAD_LIBRARY)
+
+    def normFileName(self, libname):
+        basename = os.path.basename(libname)
+        return basename.split(".")[0].split("-")[0].lower()
+
+    def _loadBinaryNorm(self, normname):
+        if not self.libloaded.get(normname, False):
+            fname = self.libpaths.get(normname)
+            if fname != None:
+                self._loadBinary(fname)
+                return True
+        return False
+
+    def _loadBinary(self, filename):
+        """
+        Check if a filename has yet to be parsed.  If it has NOT
+        been parsed, parse it and return True, otherwise, return False
+        """
+        normname = self.normFileName(filename)
+        if not self.libloaded.get(normname, False):
+            address = self.getMeta("LibraryBases").get(normname)
+            if address != None:
+                self.platformParseBinary(filename, address, normname)
+                self.libloaded[normname] = True
+                return True
+        return False
+
+    def threadWrap(self, name, meth):
+        """
+        Cause the method (given in value) to be wrapped
+        by a single thread for carying out.
+        (which allows us to only synchronize what *needs* to
+        synchronized...)
+        """
+        wrapmeth = TracerMethodProxy(meth, self.thread)
+        setattr(self, name, wrapmeth)
+
+#######################################################################
+#
+# NOTE: all platform/arch defaults are populated here.
+#
     def platformGetThreads(self):
         """
         Return a dictionary of <threadid>:<tinfo> pairs where tinfo is either
@@ -33,6 +573,15 @@ class BasePlatformMixin:
         must specify the ORIGINALLY STOPPED thread-id in the continue.
         """
         self.setMeta("ThreadId",thrid)
+
+    def platformSuspendThread(self, thrid):
+        raise Exception("Platform must implement platformSuspendThread()")
+
+    def platformResumeThread(self, thrid):
+        raise Exception("Platform must implement platformResumeThread()")
+
+    def platformInjectThread(self, pc, arg=0):
+        raise Exception("Platform must implement platformInjectThread()")
 
     def platformKill(self):
         raise Exception("Platform must implement platformKill()")
@@ -71,14 +620,10 @@ class BasePlatformMixin:
         """
         raise Exception("Platform must implement Ps")
 
-    def getBreakInstruction(self):
-        """
-        Give me the bytes for the "break" instruction
-        for this architecture.
-        """
-        raise Exception("Architecture module must implement getBreakInstruction")
+    def archGetStackTrace(self):
+        raise Exception("Architecure must implement argGetStackTrace()!")
 
-    def archAddWatchpoint(self, address):
+    def archAddWatchpoint(self, address, size=4, perms="rw"):
         """
         Add a watchpoint for the given address.  Raise if the platform
         doesn't support, or too many are active...
@@ -96,18 +641,12 @@ class BasePlatformMixin:
         """
         pass
 
-    def archGetSpName(self):
+    def archGetRegCtx(self):
         """
-        Return the name of the stack pointer for this architecture
+        Return a new empty envi.registers.RegisterContext object for this
+        trace.
         """
-        raise Exception("Architecture module must implement archGetSpName")
-
-    def archGetPcName(self):
-        """
-        Return the name from the name of the register which represents
-        the program counter for this architecture (ie. "eip" for intel)
-        """
-        raise Exception("Architecture module must implement archGetPcName")
+        raise Exception("Platform must implement archGetRegCtx()")
 
     def getStackTrace(self):
         """
@@ -116,22 +655,6 @@ class BasePlatformMixin:
         "frames list" consists of another list which is (eip,ebp)
         """
         raise Exception("Platform must implement getStackTrace()")
-
-    def getRegisterFormat(self):
-        """
-        Return a struct.unpack() style format string for
-        parsing the bytes given back from PT_GETREGS so
-        we can parse it into an array.
-        """
-        raise Exception("Platform must implement getRegisterFormat")
-
-    def getRegisterNames(self):
-        """
-        Return a list of the register names which correspods
-        (in order) with the format string specified for
-        getRegisterFormat()
-        """
-        raise Exception("Platform must implement getRegisterNames")
 
     def getExe(self):
         """
@@ -176,13 +699,16 @@ class BasePlatformMixin:
         """
         raise Exception("Platform must implement platformCall")
 
-    def platformGetRegs(self):
-        raise Exception("Platform must implement platformGetRegs!")
+    def platformGetRegCtx(self, threadid):
+        raise Exception("Platform must implement platformGetRegCtx!")
 
-    def platformSetRegs(self, bytes):
-        raise Exception("Platform must implement platformSetRegs!")
+    def platformSetRegCtx(self, threadid, ctx):
+        raise Exception("Platform must implement platformSetRegCtx!")
 
-    def platformAllocateMemory(self, size, perms=vtrace.MM_RWX, suggestaddr=0):
+    def platformProtectMemory(self, va, size, perms):
+        raise Exception("Plaform does not implement protect memory")
+        
+    def platformAllocateMemory(self, size, perms=e_mem.MM_RWX, suggestaddr=0):
         raise Exception("Plaform does not implement allocate memory")
         
     def platformReadMemory(self, address, size):
@@ -190,6 +716,15 @@ class BasePlatformMixin:
         
     def platformWriteMemory(self, address, bytes):
         raise Exception("Platform must implement platformWriteMemory!")
+
+    def platformGetMemFault(self):
+        """
+        Return the addr of the current memory fault
+        or None
+        """
+        #NOTE: This is used by the MapWatchpoint subsystem
+        # (and is still considered experimental)
+        return None
 
     def platformWait(self):
         """
@@ -214,12 +749,12 @@ class BasePlatformMixin:
         """
         raise Exception("Platform must implement platformProcessEvent")
 
-    def platformGetSymbolResolver(self, libname, address):
+    def platformParseBinary(self, filename, baseaddr, normname):
         """
-        Platforms must return a class which inherits from the VSymbolResolver
-        from vtrace.symbase.
+        Platforms must parse the given binary file and load any symbols
+        into the internal SymbolResolver using self.addSymbol()
         """
-        raise Exception("Platform must implement platformGetSymbolResolver")
+        raise Exception("Platform must implement platformParseBinary")
 
 class TracerMethodProxy:
     def __init__(self, proxymeth, thread):
@@ -276,537 +811,4 @@ class TracerThread(Thread):
                 if vtrace.verbose:
                     traceback.print_exc()
 
-
-class UtilMixin:
-    """
-    This is all the essentially internal methods that platform implementors
-    may use and the guts use directly.
-    """
-
-    def _initLocals(self):
-        """
-        The routine to initialize a tracer's initial internal state.  This
-        is used by the initial creation routines, AND on attaches/executes
-        to re-fresh the state of the tracer.
-        WARNING: This will erase all metadata/symbols (modes/notifiers are kept)
-        """
-        self.pid = 0 # Attached pid (also used to know if attached)
-        self.exited = False
-        self.breakpoints = {}
-        self.watchpoints = {}
-        self.bpid = 0
-        self.bplock = Lock()
-        self.deferredwatch = []
-        self.deferred = []
-        self.running = False
-        self.attached = False
-        # A cache for memory maps and fd listings
-        self.mapcache = None
-        self.threadcache = None
-        self.fds = None
-        self.signal_ignores = []
-
-        # For all transient data (if notifiers want
-        # to track stuff per-trace
-        self.metadata = {}
-
-        # Set up some globally expected metadata
-        self.setMeta("PendingSignal", 0)
-        self.setMeta("IgnoredSignals",[])
-        self.setMeta("AutoContinue", False)
-        self.setMeta("LibraryBases", {}) # name -> base address mappings for binaries
-        self.setMeta("ThreadId", -1) # If you *can* have a thread id put it here
-        arch = platform.machine()
-        plat = platform.system()
-        rel  = platform.release()
-        #FIXME windows hack...
-        if plat == "Windows" and arch == '':
-            arch = "i386"
-        self.setMeta("Architecture", arch)
-        self.setMeta("Platform", plat)
-        self.setMeta("Release", rel)
-
-        # Use this if we are *expecting* a break
-        # which is caused by us (so we remove the
-        # SIGBREAK from pending_signal
-        self.setMeta("ShouldBreak", False)
-
-        self.resbynorm = {} # VSymbolResolvers, indexed by "normalized" libname
-        self.resbyfile = {} # VSymbolResolvers indexed by file basename
-        self.resbyaddr = [] # VSymbolResolver order'd by load base, decending...
-
-    def nextBpId(self):
-        self.bplock.acquire()
-        x = self.bpid
-        self.bpid += 1
-        self.bplock.release()
-        return x
-
-    def unpackRegisters(self, regbuf):
-        regs = {}
-        siz = struct.calcsize(self.fmt)
-        reglist = struct.unpack(self.fmt, regbuf[:siz])
-        for i in range(len(reglist)):
-            regs[self.regnames[i]] = reglist[i]
-        return regs
-
-    def packRegisters(self, regdict):
-        p = []
-        for n in self.regnames:
-            p.append(regdict.get(n))
-        return struct.pack(self.fmt, *p)
-
-    def justAttached(self, pid):
-        """
-        platformAttach() function should call this
-        immediately after a successful attach.  This does
-        any necessary initialization for a tracer to be
-        back in a clean state.
-        """
-        self.pid = pid
-        self.attached = True
-        self.breakpoints = {}
-        self.setMeta("PendingSignal", 0)
-        self.setMeta("PendingException", None)
-        self.setMeta("ExitCode", 0)
-        self.exited = False
-
-    def getResolverForFile(self, filename):
-        res = self.resbynorm.get(filename, None)
-        if res: return res
-        res = self.resbyfile.get(filename, None)
-        if res: return res
-        return None
-
-    def steploop(self):
-        """
-        Continue stepi'ing in a loop until shouldRunAgain()
-        returns false (like RunForever mode or something)
-        """
-        if self.getMode("NonBlocking", False):
-            thr = Thread(target=self.doStepLoop)
-            thr.setDaemon(True)
-            thr.start()
-        else:
-            self.doStepLoop()
-
-    def doStepLoop(self):
-        go = True
-        while go:
-            self.stepi()
-            go = self.shouldRunAgain()
-
-    def _doRun(self):
-        # Exists to avoid recursion from loop in doWait
-        self.requireAttached()
-        self.requireNotRunning()
-        self.requireNotExited()
-
-        self.fireNotifiers(vtrace.NOTIFY_CONTINUE)
-
-        # Step past a breakpoint if we are on one.
-        self._checkForBreak()
-        # Throw down and activate breakpoints...
-        self._throwdownBreaks()
-
-        self.running = True
-        # Syncregs must happen *after* notifiers for CONTINUE
-        # and checkForBreak.
-        self.syncRegs()
-        self.platformContinue()
-        self.setMeta("PendingSignal", 0)
-
-    def wait(self):
-        """
-        Wait for the trace target to have
-        something happen...   If the trace is in
-        NonBlocking mode, this will fire a thread
-        to wait for you and return control immediately.
-        """
-        if self.getMode("NonBlocking"):
-            thr = Thread(target=self._doWait)
-            thr.setDaemon(True)
-            thr.start()
-        else:
-            self._doWait()
-
-    def _doWait(self):
-        doit = True
-        while doit:
-        # A wrapper method for  wait() and the wait thread to use
-            event = self.platformWait()
-            self.running = False
-            self.platformProcessEvent(event)
-            doit = self.shouldRunAgain()
-            if doit:
-                self._doRun()
-
-    def _throwdownBreaks(self):
-        """
-        Run through the breakpoints and setup
-        the ones that are enabled.
-        """
-        if self.getMode("FastBreak"):
-            if self.fb_bp_done:
-                return
-
-        for wp in self.deferredwatch:
-            addr = wp.resolveAddress(self)
-            if addr != None:
-                self.deferredwatch.remove(wp)
-                self.watchpoints[addr] = wp
-                self.archAddWatchpoint(addr)
-
-        # Resolve deferred breaks
-        for bp in self.deferred:
-            addr = bp.resolveAddress(self)
-            if addr != None:
-                self.deferred.remove(bp)
-                self.breakpoints[addr] = bp
-
-        for bp in self.breakpoints.values():
-            if bp.isEnabled():
-                try:
-                    bp.activate(self)
-                except:
-                    print "WARNING - bp at",hex(bp.address),"invalid, disabling"
-                    bp.setEnabled(False)
-
-        if self.getMode("FastBreak"):
-            self.fb_bp_done = True
-
-    def syncRegs(self):
-        """
-        Sync the reg-cache into the target process
-        """
-        if self.regcachedirty:
-            buf = self.packRegisters(self.regcache)
-            self.platformSetRegs(buf)
-            self.regcachedirty = False
-        self.regcache = None
-
-    def cacheRegs(self):
-        """
-        Make sure the reg-cache is populated
-        """
-        if self.regcache == None:
-            regbuf = self.platformGetRegs()
-            self.regcache = self.unpackRegisters(regbuf)
-
-    def _checkForBreak(self):
-        """
-        Check to see if we've landed on a breakpoint, and if so
-        deactivate and step us past it.
-
-        WARNING: Unfortunatly, cause this is used immidiatly before
-        a call to run/wait, we must block briefly even for the GUI
-        """
-        bp = self.breakpoints.get(self.getProgramCounter(), None)
-        if bp:
-            if bp.active:
-                bp.deactivate(self)
-                orig = self.getMode("FastStep")
-                self.setMode("FastStep", True)
-                self.stepi()
-                self.setMode("FastStep", orig)
-                bp.activate(self)
-                return True
-            else:
-                self.stepi()
-        return False
-
-    def shouldRunAgain(self):
-        """
-        A unified place for the test as to weather this trace
-        should be told to run again after reaching some stopping
-        condition.
-        """
-        if not self.attached:
-            return False
-
-        if self.exited:
-            return False
-
-        if self.getMode("RunForever"):
-            return True
-
-        if self.getMeta("AutoContinue"):
-            return True
-
-        return False
-
-    def saveRegisters(self, newregs):
-        """
-        This is used mostly by setRegisters.  Use with CAUTION: you must
-        specify ALL the register values perfectly!
-        """
-        mylist = [self.fmt,]
-        for i in range(len(self.regnames)):
-            mylist.append(newregs[self.regnames[i]])
-        bytes = struct.pack(*mylist)
-        self.platformSetRegs(bytes)
-
-    def __repr__(self):
-        run = "stopped"
-        exe = "None"
-        if self.isRunning():
-            run = "running"
-        elif self.exited:
-            run = "exited"
-        exe = self.getMeta("ExeName")
-        return "[%d]\t- %s <%s>" % (self.pid, exe, run)
-
-    def initMode(self, name, value, descr):
-        """
-        Initialize a mode, this should ONLY be called
-        during setup routines for the trace!  It determines
-        the available mode setings.
-        """
-        self.modes[name] = bool(value)
-        self.modedocs[name] = descr
-
-    def release(self):
-        """
-        Do cleanup when we're done.  This is mostly necissary
-        because of the thread proxy holding a reference to this
-        tracer...  We need to let him die off and try to get
-        garbage collected.
-        """
-        if self.thread:
-            self.thread.go = False
-
-    def __del__(self):
-        print "WOOT"
-        if self.attached:
-            self.detach()
-
-        for cls in inspect.getmro(self.__class__):
-            if cls.__name__ == "Trace":
-                continue
-
-            if hasattr(cls, "finiMixin"):
-                cls.finiMixin(self)
-
-        if self.thread:
-            self.thread.go = False
-
-
-    def fireTracerThread(self):
-        self.thread = TracerThread()
-
-    def fireNotifiers(self, event):
-        """
-        Fire the registered notifiers for the NOTIFY_* event.
-        """
-        if currentThread().__class__ == TracerThread:
-            raise Exception("ERROR: you can't fireNotifiers from *inside* the TracerThread")
-
-        # Skip out on notifiers for NOTIFY_BREAK when in
-        # FastBreak mode
-        if self.getMode("FastBreak", False) and event == vtrace.NOTIFY_BREAK:
-            return
-
-        if self.getMode("FastStep", False) and event == vtrace.NOTIFY_STEP:
-            return
-
-        if event == vtrace.NOTIFY_SIGNAL:
-            win32 = self.getMeta("Win32Event", None)
-            if win32:
-                code = win32["ExceptionCode"]
-            else:
-                code = self.getMeta("PendingSignal", 0)
-
-            if code in self.getMeta("IgnoredSignals", []):
-                if vtrace.verbose: print "Ignoring",code
-                self.setMeta("AutoContinue", True)
-                return
-
-        alllist = self.getNotifiers(vtrace.NOTIFY_ALL)
-        nlist = self.getNotifiers(event)
-
-        trace = self
-        # if the trace has a proxy it's notifiers
-        # need that, cause we can't be pickled ;)
-        if self.proxy:
-            trace = self.proxy
-
-        # The "NOTIFY_ALL" guys get priority
-        for notifier in alllist:
-            try:
-                if notifier == self:
-                    notifier.handleEvent(event,self)
-                else:
-                    notifier.handleEvent(event,trace)
-            except:
-                print "WARNING: Notifier exception for",repr(notifier)
-                traceback.print_exc()
-
-        for notifier in nlist:
-            try:
-                if notifier == self:
-                    notifier.handleEvent(event,self)
-                else:
-                    notifier.handleEvent(event,trace)
-            except:
-                print "WARNING: Notifier exception for",repr(notifier)
-                traceback.print_exc()
-
-    def cleanupBreakpoints(self):
-        self.fb_bp_done = False
-        for bp in self.breakpoints.itervalues():
-            # No harm in calling deactivate on
-            # an inactive bp
-            bp.deactivate(self)
-
-    def checkWatchpoints(self):
-        addr = self.archCheckWatchpoints()
-        if not addr:
-            return False
-        wp = self.watchpoints.get(addr, None)
-        if not wp:
-            return False
-
-        wp.notify(vtrace.NOTIFY_BREAK, self)
-        self.fireNotifiers(vtrace.NOTIFY_BREAK)
-        return True
-
-    def getCurrentBreakpoint(self):
-        """
-        Return the current breakpoint otherwise None
-        """
-        # NOTE: Check breakpoints below can't use this cause
-        # it comes before we've stepped back
-        return self.breakpoints.get(self.getProgramCounter(), None)
-
-    def checkBreakpoints(self):
-        """
-        This is mostly for systems (like linux) where you can't tell
-        the difference between some SIGSTOP/SIGBREAK conditions and
-        an actual breakpoint instruction.
-        This method will return true if either the breakpoint
-        subsystem or the sendBreak (via ShouldBreak meta) is true
-        """
-        if self.checkWatchpoints():
-            return True
-
-        pc = self.getProgramCounter()
-        bi = self.getBreakInstruction()
-        bl = pc - len(bi)
-        bp = self.breakpoints.get(bl, None)
-
-        if bp:
-            addr = bp.getAddress()
-            # Step back one instruction to account break
-            self.setProgramCounter(addr)
-            self.fireNotifiers(vtrace.NOTIFY_BREAK)
-            try:
-                bp.notify(vtrace.NOTIFY_BREAK, self)
-            except Exception, msg:
-                print "Breakpoint Exception 0x%.8x : %s" % (addr,msg)
-            return True
-
-        elif self.getMeta("ShouldBreak"):
-            self.setMeta("ShouldBreak", False)
-            self.fireNotifiers(vtrace.NOTIFY_BREAK)
-            return True
-
-        return False
-
-    def notify(self, event, trace):
-        """
-        We are frequently a notifier for ourselves, so we can do things
-        like handle events on attach and on break in a unified fashion.
-        """
-        self.threadcache = None
-        self.mapcache = None
-        self.fds = None
-        self.running = False
-
-        if event in self.auto_continue:
-            self.setMeta("AutoContinue", True)
-        else:
-            self.setMeta("AutoContinue", False)
-
-        if event == vtrace.NOTIFY_ATTACH:
-            pass
-
-        elif event == vtrace.NOTIFY_DETACH:
-            self.cleanupBreakpoints()
-
-        elif event == vtrace.NOTIFY_EXIT:
-            self.setMode("RunForever", False)
-            self.exited = True
-            self.attached = False
-
-        elif event == vtrace.NOTIFY_CONTINUE:
-            pass
-
-        elif event == vtrace.NOTIFY_LOAD_LIBRARY:
-            self.cleanupBreakpoints()
-
-        else:
-            if not self.getMode("FastBreak"):
-                self.cleanupBreakpoints()
-
-
-    def addLibraryBase(self, libname, address):
-        """
-        This should be used *at load time* to setup the library
-        event metadata.  This will also instantiate a VSymbolResolver
-        for this platform and setup the internal structures as necissary
-
-        This returns True/False for whether or not the library is
-        going to be parsed (False on duplicate or non-file).
-
-        This *must* be called from a context where it's safe to
-        fire notifiers, because it will fire a notifier to alert
-        about a LOAD_LIBRARY. (This means *not* from inside another
-        notifer)
-        """
-        basename = os.path.basename(libname)
-
-        self.setMeta("LatestLibrary", None)
-        self.setMeta("LatestLibraryNorm", None)
-
-        # Only actually do library work
-        if (os.path.exists(libname) and
-            not self.getMeta("LibraryBases").has_key(basename)):
-
-            resolver = self.platformGetSymbolResolver(libname, address)
-            self.resbynorm[resolver.normname] = resolver
-            self.resbyfile[resolver.basename] = resolver
-            self.getMeta("LibraryBases")[resolver.normname] = address
-
-            self.setMeta("LatestLibrary", libname)
-            self.setMeta("LatestLibraryNorm", resolver.normname)
-
-            # We keep a descending order'd list of the resolver's base's so we
-            # Can find the best resolver for an address quickly
-            #FIXME move this to inside the resolvers
-            index = 0
-            if len(self.resbyaddr) > 0:
-                index = None
-                for i in range(len(self.resbyaddr)):
-                    if resolver.loadbase > self.resbyaddr[i].loadbase:
-                        index = i
-                        break
-                if index != None:
-                    self.resbyaddr.insert(index, resolver)
-                else:
-                    self.resbyaddr.append(resolver)
-            else:
-                self.resbyaddr.append(resolver)
-
-        self.fireNotifiers(vtrace.NOTIFY_LOAD_LIBRARY)
-        return True
-
-    def threadWrap(self, name, meth):
-        """
-        Cause the method (given in value) to be wrapped
-        by a single thread for carying out.
-        (which allows us to only synchronize what *needs* to
-        synchronized...)
-        """
-        wrapmeth = TracerMethodProxy(meth, self.thread)
-        setattr(self, name, wrapmeth)
 

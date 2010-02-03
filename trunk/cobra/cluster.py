@@ -24,7 +24,10 @@ import cobra.cluster
 cobra.cluster.getAndDoWork("%s", docode=%s)
 """
 
-wid_lock = threading.Lock()
+class InvalidInProgWorkId(Exception):
+    def __init__(self, workid):
+        Exception.__init__(self, "Work ID %d is not valid" % workid)
+        self.workid = workid
 
 class ClusterWork(object):
     """
@@ -36,8 +39,29 @@ class ClusterWork(object):
         object.__init__(self)
         self.id = None # Set by adding to the server
         self.server = None # Set by ClusterClient
-        self.tottime = None # Set on return to server (maybe used by done() callback)
+        self.starttime = 0
+        self.endtime = 0 # Both are set by worker before and after work()
         self.timeout = timeout
+        self.touchtime = None
+        self.excinfo = None # Will be exception traceback on work unit fail.
+
+    def touch(self): # heh...
+        """
+        Update the internal "touch time" which is used by the timeout
+        subsystem to see if this work unit has gone too long without
+        making progress...
+        """
+        self.touchtime = time.time()
+
+    def isTimedOut(self):
+        """
+        Check if this work unit is timed out.
+        """
+        if self.timeout == None:
+            return False
+        if self.touchtime == None:
+            return False
+        return (self.touchtime + self.timeout) < time.time()
 
     def work(self):
         """
@@ -61,6 +85,7 @@ class ClusterWork(object):
         Work units may call this whenever they like to
         tell the server how far along their work they are.
         """
+        self.touch()
         self.server.setWorkCompletion(self.id, percent)
 
     def setStatus(self, status):
@@ -68,6 +93,7 @@ class ClusterWork(object):
         Work units may call this to inform the server of
         their status.
         """
+        self.touch()
         self.server.setWorkStatus(self.id, status)
 
 class ClusterCallback:
@@ -87,21 +113,63 @@ class ClusterCallback:
         pass
     def workDone(self, server, work):
         pass
+    def workFailed(self, server, work):
+        pass
     def workTimeout(self, server, work):
         pass
+    def workCanceled(self, server, work):
+        pass
+
+class VerboseCallback(ClusterCallback):
+    # This is mostly for testing...
+    def workAdded(self, server, work):
+        print "WORK ADDED: %d" % work.id
+    def workGotten(self, server, work):
+        print "WORK GOTTEN: %d" % work.id
+    def workStatus(self, server, workid, status):
+        print "WORK STATUS: (%d) %s" % (workid, status)
+    def workCompletion(self, server, workid, completion):
+        print "WORK COMPLETION: (%d) %d%%" % (workid, completion)
+    def workDone(self, server, work):
+        print "WORK DONE: %d" % work.id
+    def workFailed(self, server, work):
+        print "WORK FAILED: %d" % work.id
+    def workTimeout(self, server, work):
+        print "WORK TIMEOUT: %d" % work.id
+    def workCanceled(self, server, work):
+        print "WORK CANCELED %d" % work.id
+
+import collections
 
 class ClusterServer:
-    def __init__(self, name, maxsize=0, docode=False):
+    def __init__(self, name, maxsize=None, docode=False, bindsrc="", cobrad=None):
+        """
+        The cluster server is the core of the code that manages work units.
+
+        Arguments:
+            maxsize - How big should the work queue be before add blocks
+            docode  - Should we also be a dcode server?
+            bindsrc - Should we bind a src IP for our multicast announcements?
+            cobrad  - Should we use an existing cobra daemon to share our objects?
+        """
         self.go = True
-        self.added = False
         self.name = name
         self.nextwid = 0
         self.inprog = {}
-        self.timer = {}
         self.maxsize = maxsize
-        self.queue = Queue.Queue(maxsize)
-        self.cobrad = cobra.CobraDaemon(host="", port=0)
+        self.queue = collections.deque()
+        self.qcond = threading.Condition()
+        self.widiter = iter(xrange(999999999))
+
+        # Initialize a cobra daemon if needed
+        if cobrad == None:
+            cobrad = cobra.CobraDaemon(host="", port=0)
+        self.cobrad = cobrad
         self.cobraname = self.cobrad.shareObject(self)
+
+        # Setup our transmission socket
+        self.sendsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sendsock.bind((bindsrc, 0))
 
         # Set this to a ClusterCallback extension if
         # you want notifications.
@@ -110,22 +178,47 @@ class ClusterServer:
         if docode:
             self.cobrad.shareObject(dcode.DcodeFinder(), "DcodeServer")
 
-    def _checkTimeouts(self):
+        # Fire the timeout monitor thread...
+        thr = threading.Thread(target=self.timerThread)
+        thr.setDaemon(True)
+        thr.start()
+
+    def __touchWork(self, workid):
+        # Used to both validate an inprog workid *and*
+        # update it's timestamp for the timeout thread
+        work = self.inprog.get(workid, None)
+        if work == None:
+            raise InvalidInProgWorkId(workid)
+        work.touch()
+
+    def __cleanWork(self, workid):
+        # Used by done/timeout/etc to clea up an in
+        # progress work unit
+        return self.inprog.pop(workid, None)
+
+    def timerThread(self):
         # Internal function to monitor work unit time
-        now = time.time()
-        for id,work in self.inprog.items():
-            if work.timeout == None:
-                continue
+        while self.go:
+            try:
+                for id,work in self.inprog.items():
+                    if work.isTimedOut():
+                        self.timeoutWork(work)
 
-            start = self.timer.get(id)
+            except Exception, e:
+                print "ClusterTimer: %s" % e
 
-            if now - start > work.timeout:
-                self.timer.pop(id)
-                self.inprog.pop(id)
-                self.timeoutWork(work)
+            time.sleep(2)
 
     def shutdownServer(self):
         self.go = False
+
+    def announceWork(self):
+        """
+        Announce to our multicast cluster peers that we have work
+        to do!
+        """
+        buf = "cobra:%s:%s:%d" % (self.name, self.cobraname, self.cobrad.port)
+        self.sendsock.sendto(buf, (cluster_ip, cluster_port))
 
     def runServer(self, firethread=False):
         if firethread:
@@ -134,49 +227,73 @@ class ClusterServer:
             thr.start()
         else:
             self.cobrad.fireThread()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             while self.go:
-                if not self.queue.empty():
-                    buf = "cobra:%s:%s:%d" % (self.name, self.cobraname, self.cobrad.port)
-                    sock.sendto(buf, (cluster_ip, cluster_port))
-                self._checkTimeouts()
+                if len(self.queue):
+                    self.announceWork()
+
                 time.sleep(2)
+
+    def inQueueCount(self):
+        """
+        How long is the current work unit queue.
+        """
+        return len(self.queue)
+
+    def inProgressCount(self):
+        """
+        How many work units are in progress?
+        """
+        return len(self.inprog)
 
     def addWork(self, work):
         """
         Add a work object to the ClusterServer.  This 
         """
-        self.added = True # One time add detection
         if not isinstance(work, ClusterWork):
             raise Exception("%s is not a ClusterWork extension!")
-        # Get the next work unit id
-        wid_lock.acquire()
-        id = self.nextwid
-        self.nextwid += 1
-        wid_lock.release()
-        work.id = id
-        self.queue.put(work)
+
+        # If this work has no ID, give it one
+        if work.id == None:
+            work.id = self.widiter.next()
+
+        self.qcond.acquire()
+        if self.maxsize != None:
+            while len(self.queue) >= self.maxsize:
+                self.qcond.wait()
+        self.queue.append(work)
+        self.qcond.release()
+
         if self.callback:
             self.callback.workAdded(self, work)
 
     def getWork(self):
+
+        self.qcond.acquire()
+
         try:
-            ret = self.queue.get_nowait()
-            self.inprog[ret.id] = ret
-            self.timer[ret.id] = time.time()
-            if self.callback:
-                self.callback.workGotten(self, ret)
-            return ret
-        except Queue.Empty, e:
+            ret = self.queue.popleft()
+        except IndexError, e:
+            self.qcond.release()
             return None
+
+        self.qcond.notifyAll()
+        self.qcond.release()
+
+        self.inprog[ret.id] = ret
+        self.__touchWork(ret.id)
+
+        if self.callback:
+            self.callback.workGotten(self, ret)
+
+        return ret
+
 
     def doneWork(self, work):
         """
         Used by the clients to report work as done.
         """
-        self.inprog.pop(work.id)
-        start = self.timer.pop(work.id)
-        work.tottime = time.time()-start
+        self.__cleanWork(work.id)
+
         work.done()
         if self.callback:
             self.callback.workDone(self, work)
@@ -186,14 +303,81 @@ class ClusterServer:
         This method may be over-ridden to handle
         work units that time our for whatever reason.
         """
+        self.__cleanWork(work.id)
         if self.callback:
             self.callback.workTimeout(self, work)
 
+    def failWork(self, work):
+        """
+        This is called for a work unit that is in a failed state.  This is most
+        commonly that the work() method has raised an exception.
+        """
+        self.__cleanWork(work.id)
+        if self.callback:
+            self.callback.workFailed(self, work)
+
+    def cancelAllWork(self, inprog=True):
+        """
+        Cancel all of the currently pending work units.  You may
+        specify inprog=False to cancel all *queued* work units
+        but allow inprogress work units to complete.
+        """
+        self.qcond.acquire()
+        qlist = list(self.queue)
+        self.queue.clear()
+
+        if inprog:
+            p = self.inprog
+            self.inprog = {}
+            qlist.extend(p.values())
+
+        self.qcond.notifyAll()
+        self.qcond.release()
+
+        if self.callback:
+            for w in qlist:
+                self.callback.workCanceled(self, w)
+        
+    def cancelWork(self, workid):
+        """
+        Cancel a work unit by ID.
+        """
+        cwork = self.__cleanWork(workid)
+
+        # Remove it from the work queue
+        # (if we didn't find in inprog)
+        if cwork == None:
+            self.qcond.acquire()
+            qlist = list(self.queue)
+            self.queue.clear()
+            for work in qlist:
+                if work.id != workid:
+                    self.queue.append(work)
+                else:
+                    cwork = work
+
+            self.qcond.notifyAll()
+            self.qcond.release()
+
+        if cwork == None:
+            return
+
+        if self.callback:
+            self.callback.workCanceled(self, cwork)
+
     def setWorkStatus(self, workid, status):
+        """
+        Set the humon readable status for the given work unit.
+        """
+        self.__touchWork(workid)
         if self.callback:
             self.callback.workStatus(self, workid, status)
 
     def setWorkCompletion(self, workid, percent):
+        """
+        Set the percentage completion status for this work unit.
+        """
+        self.__touchWork(workid)
         if self.callback:
             self.callback.workCompletion(self, workid, percent)
 
@@ -205,15 +389,13 @@ class ClusterClient:
 
     maxwidth is the number of work units to do in parallel
     docode will enable code sharing with the server
-    threaded == True will use threads, otherwise subprocess of the python interpreter (OMG CLUSTER)
     """
 
-    def __init__(self, name, maxwidth=4, threaded=True, docode=False):
+    def __init__(self, name, maxwidth=4, docode=False):
         self.go = True
         self.name = name
         self.width = 0
         self.maxwidth = maxwidth
-        self.threaded = threaded
         self.verbose = False
         self.docode = docode
 
@@ -280,12 +462,45 @@ def getHostPortFromUri(uri):
         port = int(hparts[1])
     return host,port
 
-def workThread(work):
+def workThread(server, work):
     try:
+        work.server = server
+        work.starttime = time.time()
+        work.touch()
         work.work()
+        work.endtime = time.time()
         work.server.doneWork(work)
+
+    except InvalidInProgWorkId, e: # the work was canceled
+        pass # Nothing to do, the server already knows
+
     except Exception, e:
+        # Tell the server that the work unit failed
+        work.excinfo = traceback.format_exc()
+        work.server.failWork(work)
         traceback.print_exc()
+
+def runAndWaitWork(server, work):
+
+    thr = threading.Thread(target=workThread, args=(server, work))
+    thr.setDaemon(True)
+    thr.start()
+
+    # Wait around for done or timeout
+    while True:
+        if work.isTimedOut():
+            break
+
+        # If the thread is done, lets get out.
+        if not thr.isAlive():
+            break
+
+        # If our parent, or some thread closes stdin,
+        # time to pack up and go.
+        if sys.stdin.closed:
+            break
+
+        time.sleep(2)
 
 def getAndDoWork(uri, docode=False):
 
@@ -303,29 +518,7 @@ def getAndDoWork(uri, docode=False):
         work = proxy.getWork()
         # If we got work, do it.
         if work != None:
-            work.server = proxy
-
-            thr = threading.Thread(target=workThread, args=(work,))
-            thr.setDaemon(True)
-            thr.start()
-
-            # Wait around for done or timeout
-            start = time.time()
-            while True:
-                if work.timeout != None:
-                    if (time.time() - start) >= work.timeout:
-                        break
-
-                # If the thread is done, lets get out.
-                if not thr.isAlive():
-                    break
-
-                # If our parent, or some thread closes stdin,
-                # time to pack up and go.
-                if sys.stdin.closed:
-                    break
-
-                time.sleep(2)
+            runAndWaitWork(proxy, work)
 
     except Exception, e:
         traceback.print_exc()

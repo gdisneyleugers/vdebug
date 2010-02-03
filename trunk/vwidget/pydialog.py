@@ -5,6 +5,7 @@ from threading import Thread
 
 import gtk
 import vwidget
+import vwidget.main as vw_main
 import vwidget.windows as vw_windows
 
 class ScriptThread(Thread):
@@ -42,4 +43,6 @@ class PyDialog(vw_windows.VWindow):
         cobj = compile(pystring, "pydialog_exec.py", "exec")
         sthr = ScriptThread(cobj, self.locals)
         sthr.start()
+        # FIXME set button insensitive and have ScriptThread take
+        # a reference to the dialog and change it back when run is complete
 

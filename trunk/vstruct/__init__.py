@@ -1,287 +1,300 @@
 
-"""
-A package for parsing structures out into their fields and nest them
-
-These structures are fairly similar to how structures work in ctypes.
-I would probably have used ctypes Structure objects except that they
-are not pickleable.
-
-"""
-
 import struct
-import inspect
+from StringIO import StringIO
 
-from vstruct.primitives import *
+import vstruct.primitives as vs_prims
 
-class VStructParseException(Exception):
-    def __init__(self, structname, wantedsize, gotsize):
-        self.sname = structname
-        self.wanted = wantedsize
-        self.got = gotsize
-        Exception.__init__(self, "Struct %s wanted %d bytes but got %d" % (structname, wantedsize, gotsize))
+def isVstructType(x):
+    return isinstance(x, vs_prims.v_base)
 
-class VStructInvalidField(Exception):
-    def __init__(self, sname, fname):
-        self.sname = sname
-        self.fname = fname
-        Exception.__init__(self, "Struct %s has no field %s" % (sname, fname))
+class VStruct(vs_prims.v_base):
 
-def calcformat(vclass):
-    """
-    Calculate the format for the given vstruct class.  This creates a central
-    way for arrays/structs/primatives to be handled for format string creation.
-    """
-    if vclass._fmt_ == "O": # A VStruct
-        base = vclass._endian_
-        for name, vtype in vclass._fields_:
-            if vtype._fmt_ in ["A","O"]:
-                f = calcformat(vtype)
-                size = struct.calcsize(f)
-                base += "%ds" % size
-            else:
-                base += vtype._fmt_
+    def __init__(self):
+        # A tiny bit of evil...
+        object.__setattr__(self, "_vs_values", {})
+        vs_prims.v_base.__init__(self)
+        self._vs_name = self.__class__.__name__
+        self._vs_fields = []
+        self._vs_field_align = False # To toggle visual studio style packing
+        self._vs_padnum = 0
 
-    elif vclass._fmt_ == "A": # A VArray
+    def vsParse(self, bytes):
+        """
+        For all the primitives contained within, allow them
+        an opportunity to parse the given data and return the
+        total offset...
+        """
+        plist = self.vsGetPrims()
+        fmt = self.vsGetFormat()
+        size = struct.calcsize(fmt)
+        vals = struct.unpack(fmt, bytes[:size])
+        for i in range(len(plist)):
+            plist[i].vsSetParsedValue(vals[i])
 
-        base = vclass._endian_
-        vtype = vclass._field_type_
-        if vtype._fmt_ in ["A","O"]:
-            f = calcformat(vtype)
-            size = struct.calcsize(f)
-            base += ("%ds" % size) * vclass._field_count_
-        else:
-            base += vtype._fmt_ * vclass._field_count_
+    def vsEmit(self):
+        """
+        Get back the byte sequence associated with this structure.
+        """
+        fmt = self.vsGetFormat()
+        r = []
+        for p in self.vsGetPrims():
+            r.append(p.vsGetValue())
+        return struct.pack(fmt, *r)
 
-    else: # A "primative"
-        base = vclass._fmt_
-
-    return base
-
-def calcoffset(vclass, fieldname):
-    offset = 0
-    for name,vsclass in vclass._fields_:
-        if name == fieldname:
-            return offset
-        offset += calcsize(vsclass)
-    raise VStructInvalidField(vclass.__name__, fieldname)
-
-def calcsize(vclass):
-    return struct.calcsize(calcformat(vclass))
-
-class VArrayIter(object):
-    def __init__(self, varray):
-        object.__init__(self)
-        self.va = varray
-        self.max = varray.length
-        self.cur = 0
-
-    def next(self):
-        if self.cur == self.max:
-            raise StopIteration()
-        val = self.va[self.cur]
-        self.cur += 1
-        return val
-
-class VArray(object):
-    _fmt_ = "A"
-    _field_type_ = None
-    _field_count_ = 0
-    _endian_ = "<"
-
-    def __init__(self, bytes=None):
-        object.__init__(self)
-        self.fmt = calcformat(self.__class__)
-        self.vtype = self.__class__._field_type_
-        self.length = self.__class__._field_count_ # Number of fields
-        self.size = struct.calcsize(self.fmt)
-        self.values = []
-        if bytes == None:
-            bytes = "\x00" * self.size
-
-        self.parseBytes(bytes)
-
-    def parseBytes(self, bytes):
-        self.values = []
-        if len(bytes) != self.size:
-            raise VStructParseException(self.__class__.__name__, self.size, len(bytes))
-        row = struct.unpack(self.fmt, bytes)
-        for val in row:
-            self.values.append(self.vtype(val))
-
-    def __repr__(self):
-        ret = "\n"
-        index = 0
-        for x in self:
-            ret += "[%d] %s\n" % (index,repr(x))
-            index += 1
+    def vsGetFormat(self):
+        """
+        Return the format specifier which would then be used
+        """
+        # Unpack everything little endian, let vsParseValue deal...
+        ret = "<"
+        for p in self.vsGetPrims():
+            ret += p.vsGetFormat()
         return ret
 
-    def __getitem__(self, index):
-        return self.values[index]
+    def vsIsPrim(self):
+        return False
 
-    def __iter__(self):
-        return VArrayIter(self)
-
-    def getPrintInfo(self):
+    def vsGetFields(self):
         ret = []
-        ret.append((0, "Array: %s" % self.__class__.__name__))
-        fsize = calcsize(self.__class__._field_type_)
-        for i in range(self.length):
-            offset = i * fsize
-            e = self[i]
-            if isinstance(e, VStruct) or isinstance(e, VArray):
-                for soff,stxt in e.getPrintInfo():
-                    ret.append((offset+soff,"  %s" % stxt))
+        for fname in self._vs_fields:
+            fobj = self._vs_values.get(fname)
+            ret.append((fname,fobj))
+        return ret
+
+    def vsGetField(self, name):
+        x = self._vs_values.get(name)
+        if x == None:
+            raise Exception("Invalid field: %s" % name)
+        return x
+
+    def vsSetField(self, name, value):
+        if isVstructType(value):
+            self._vs_values[name] = value
+            return
+        x = self._vs_values.get(name)
+        return x.vsSetValue(value)
+
+    def vsAddField(self, name, value):
+        if not isVstructType(value):
+            raise Exception("Added fields MUST be vstruct types!")
+
+        # Do optional field alignment...
+        if self._vs_field_align:
+
+            # If it's a primitive, all is well, if not, pad to size of
+            # the first element of the VStruct/VArray...
+            if value.vsIsPrim():
+                align = len(value)
             else:
-                ret.append((offset, "[%4d] %s" % (i,repr(self[i]))))
+                fname = value._vs_fields[0]
+                align = len(value._vs_values.get(fname))
+
+            delta = len(self) % align
+            if delta != 0:
+                print "PADDING %s by %d" % (name,align-delta)
+                pname = "_pad%d" % self._vs_padnum
+                self._vs_padnum += 1
+                self._vs_fields.append(pname)
+                self._vs_values[pname] = vs_prims.v_bytes(align-delta)
+
+        self._vs_fields.append(name)
+        self._vs_values[name] = value
+
+    def vsGetPrims(self):
+        """
+        return an order'd list of the primitive fields in this
+        structure definition.  This is recursive and will return
+        the sub fields of all nested structures.
+        """
+        ret = []
+        for name, field in self.vsGetFields():
+            if field.vsIsPrim():
+                ret.append(field)
+            else:
+                ret.extend(field.vsGetPrims())
 
         return ret
 
+    def vsGetTypeName(self):
+        return self._vs_name
 
-class VStruct(object):
-    """
-    The base vstruct object.  This object may be extended *mostly*
-    by setting the class-local value _fields_.  Once fields are setup
-    you may use a vstruct derived class to parse out byte sequences
-    into programatically accessable fields which dereferenceable
-    from the instantiated structure object.  Support will probably
-    be eventually implemented for writting to those same values
-    and zipping it back up into a byte sequence.
-    """
-    _fields_ = ()
-    _fmt_ = 'O'
-    _endian_ = "<" # Packed/Little endian by default
-
-    #FIXME eventually support passing in a mem object for write values
-    def __init__(self, bytes=None):
-        object.__init__(self)
-        # Cache our own format
-        self.fmt = calcformat(self.__class__)
-        self.size = struct.calcsize(self.fmt)
-
-        self.indexes = {} # Index into the list of values keyed by name
-        self.offsets = {} # Byte offset into the structure keyed by name
-        self.values = []  # Most recently parsed values
-
-        index = 0
+    def vsGetOffset(self, name):
+        """
+        Return the offset of a member.
+        """
         offset = 0
-        for name, vtype in self.__class__._fields_:
-            self.offsets[name] = offset
-            self.indexes[name] = index
-            offset += struct.calcsize(calcformat(vtype))
-            index += 1
+        for fname in self._vs_fields:
+            if name == fname:
+                return offset
+            x = self._vs_values.get(fname)
+            offset += len(x)
+        raise Exception("Invalid Field Specified!")
 
-        if bytes == None:
-            bytes = "\x00" * self.size
-
-        self.parseBytes(bytes)
-
-    def getPrintInfo(self):
+    def vsGetPrintInfo(self, offset=0, indent=0, top=True):
         ret = []
-        ret.append((0, "Struct: %s" % self.__class__.__name__))
-        for name,ctype in self.__class__._fields_:
-            x = getattr(self, name)
-            off = self.offsets.get(name)
-            if isinstance(x, VStruct) or isinstance(x, VArray):
-                for soff,stxt in x.getPrintInfo():
-                    ret.append((off+soff, "  %s" % stxt))
+        if top:
+            ret.append((offset, indent, self._vs_name, self))
+        indent += 1
+        for fname in self._vs_fields:
+            x = self._vs_values.get(fname)
+            off = offset + self.vsGetOffset(fname)
+            if isinstance(x, VStruct):
+                ret.append((off, indent, fname, x))
+                ret.extend(x.vsGetPrintInfo(offset=off, indent=indent, top=False))
             else:
-                ret.append((off, "%s: %s" % (name,repr(x))))
+                ret.append((off, indent, fname, x))
         return ret
-
-    def __getstate__(self):
-        return (self.fmt, self.size, self.indexes, self.offsets, self.values)
-
-    def __setstate__(self, state):
-        (self.fmt,
-         self.size,
-         self.indexes,
-         self.offsets,
-         self.values) = state
 
     def __len__(self):
-        return self.size
-
-    def parseBytes(self, bytes):
-        self.values = []
-        size = len(self)
-        if len(bytes) != size:
-            raise VStructParseException(self.__class__.__name__, size, len(bytes))
-
-        fields = struct.unpack(self.fmt, bytes)
-        for i in range(len(fields)):
-            name,vtype = self._fields_[i]
-            self.values.append(vtype(fields[i]))
-
-    def getOffset(self, fname):
-        """
-        Get the offset from this struct to the named field.
-        """
-        return self.offsets.get(fname)
+        fmt = self.vsGetFormat()
+        return struct.calcsize(fmt)
 
     def __getattr__(self, name):
-        index = self.indexes.get(name, None)
-        if index == None:
-            raise VStructInvalidField(self.__class__.__name__, name)
-        return self.values[index]
+        # Gotta do this for pickle issues...
+        vsvals = self.__dict__.get("_vs_values")
+        if vsvals == None:
+            vsvals = {}
+            self.__dict__["_vs_values"] = vsvals
+        r = vsvals.get(name)
+        if r is None:
+            raise AttributeError(name)
+        if isinstance(r, vs_prims.v_prim):
+            return r.vsGetValue()
+        return r
+
+    def __setattr__(self, name, value):
+        # If we have this field, asign to it
+        x = self._vs_values.get(name, None)
+        if x != None:
+            return self.vsSetField(name, value)
+
+        # If it's a vstruct type, create a new field
+        if isVstructType(value):
+            return self.vsAddField(name, value)
+
+        # Fail over to standard object attribute behavior
+        return object.__setattr__(self, name, value)
+
+    def __iter__(self):
+        # Our iteration returns name,field pairs
+        ret = []
+        for name in self._vs_fields:
+            ret.append((name, self._vs_values.get(name)))
+        return iter(ret)
 
     def __repr__(self):
-        ret = "Struct %s:\n" % self.__class__.__name__
-        for name,ctype in self.__class__._fields_:
-            x = getattr(self, name)
-            ret += "%s: %s\n" % (name, repr(x))
+        return self._vs_name
+
+    def tree(self, va=0):
+        ret = ""
+        for off, indent, name, field in self.vsGetPrintInfo():
+            rstr = field.vsGetTypeName()
+            if isinstance(field, vs_prims.v_prim):
+                rstr = repr(field)
+            ret += "%.8x%s %s: %s\n" % (va+off, " "*(indent*2),name,rstr)
         return ret
 
+class VArray(VStruct):
 
-struct_modules = {
-}
+    def __init__(self, elems=()):
+        VStruct.__init__(self)
+        for e in elems:
+            self.vsAddElement(e)
 
-def registerStructModule(mod):
-    name = mod.__name__.split(".")[-1]
-    struct_modules[name] = mod
+    def vsAddElement(self, elem):
+        """
+        Used to add elements to an array
+        """
+        idx = len(self._vs_fields)
+        self.vsAddField("%d" % idx, elem)
 
-# Our Modules!
-import win32
-import pe
-import elf
-registerStructModule(win32)
-registerStructModule(pe)
-registerStructModule(elf)
-# Soon to be python
-# Soon to be vista
+    def __getitem__(self, index):
+        return self.vsGetField("%d" % index)
+
+    #FIXME slice asignment
+
+def resolve(impmod, nameparts):
+    """
+    Resolve the given (potentially nested) object
+    from within a module.
+    """
+    if not nameparts:
+        return None
+
+    m = impmod
+    for nname in nameparts:
+        m = getattr(m, nname, None)
+        if m == None:
+            break
+
+    return m
+
+added_structs = {}
+# NOTE: Gotta import this *after* VStruct/VSArray defined
+import vstruct.defs as vs_defs
+
+def getStructure(sname):
+    """
+    Return an instance of the specified structure.  The
+    structure name may be a definition that was added with
+    addStructure() or a python path (ie. win32.TEB) of a
+    definition from within vstruct.defs.
+    """
+    s = added_structs.get(sname, None)
+    if s != None:
+        return s()
+
+    x = resolve(vs_defs, sname.split("."))
+    if x != None:
+        return x()
+
+    return None
+
+def addStructure(sname, builder):
+    """
+    Add a new structure definition.  This is
+    done by adding a builder which will be called
+    when somebody requests an instance of the
+    new struct.
+    """
+    added_structs[sname] = builder
+
+def buildStructure(name, fields):
+    """
+    Build a structure which was defined at runtime.
+
+    fields is a list of (name, type, kwargs) tuples.
+    """
+    s = VStruct(name)
+    for fname, ftype, kwargs in fields:
+        f = ftype(**kwargs)
+        s.vsAddField(fname, f)
+    return s
+
+class StructureBuilder:
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields
+
+    def __call__(self):
+        return buildStructure(self.name, self.fields)
+
+def addStructureBuilder(name, fields):
+    addStructure(name, StructureBuilder(name, fields))
 
 def getModuleNames():
-    """
-    Get the list of struct module names which are
-    used to access structure classes (namespace).
-    """
-    return struct_modules.keys()
+    return [x for x in dir(vs_defs) if not x.startswith("__")]
 
 def getStructNames(modname):
-    """
-    Get a list of all the known structure names from the
-    specified module name
-    """
-    return getNamesFromModule(struct_modules.get(modname))
-
-def getNamesFromModule(mod):
     ret = []
-    for name in dir(mod):
-        cls = getattr(mod, name)
-        if not inspect.isclass(cls):
-            continue
-        if issubclass(cls, VStruct):
-            ret.append(name)
-    ret.sort()
-    return ret
+    mod = resolve(vs_defs, modname)
+    if mod == None:
+        return ret
 
-def getStructClass(name):
-    """
-    Get the structure class specified in name.  Name must
-    bue a vstruct module.structname combination (ie. win32.PEB).
-    """
-    if name.find(".") == -1:
-        raise Exception("Invalid Structure Name: %s" % name)
-    modname,clsname = name.split(".")
-    return getattr(struct_modules[modname], clsname)
+    for n in dir(mod):
+        x = getattr(mod, n)
+        if issubclass(x, VStruct):
+            ret.append(n)
+
+    return ret
 

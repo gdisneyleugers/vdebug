@@ -63,7 +63,7 @@ class DcodeImporter(object):
     This object goes into the client side import path_hooks
     to allow cobra:// uri's to be added to the import path.
     """
-    def __init__(self, uri):
+    def __init__(self, uri, retrymax=3, timeout=10):
         object.__init__(self)
 
         if not cobra.isCobraUri(uri):
@@ -78,7 +78,7 @@ class DcodeImporter(object):
         self.path = path
 
         try:
-            self.cobra = cobra.CobraProxy(uri)
+            self.cobra = cobra.CobraProxy(uri, retrymax=retrymax, timeout=timeout)
         except Exception, e:
             raise ImportError
 

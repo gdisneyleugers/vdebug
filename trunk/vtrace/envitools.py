@@ -7,7 +7,7 @@ import sys
 import traceback
 
 import envi
-import envi.intel as e_intel # FIXME This should NOT have to be here
+import envi.archs.i386 as e_i386 # FIXME This should NOT have to be here
 
 class RegisterException(Exception):
     pass
@@ -21,16 +21,16 @@ def cmpRegs(emu, trace):
     return True
 
 reg_map = [
-    (e_intel.REG_EAX, "eax"),
-    (e_intel.REG_ECX, "ecx"),
-    (e_intel.REG_EDX, "edx"),
-    (e_intel.REG_EBX, "ebx"),
-    (e_intel.REG_ESP, "esp"),
-    (e_intel.REG_EBP, "ebp"),
-    (e_intel.REG_ESI, "esi"),
-    (e_intel.REG_EDI, "edi"),
-    (e_intel.REG_EIP, "eip"),
-    (e_intel.REG_FLAGS, "eflags")
+    (e_i386.REG_EAX, "eax"),
+    (e_i386.REG_ECX, "ecx"),
+    (e_i386.REG_EDX, "edx"),
+    (e_i386.REG_EBX, "ebx"),
+    (e_i386.REG_ESP, "esp"),
+    (e_i386.REG_EBP, "ebp"),
+    (e_i386.REG_ESI, "esi"),
+    (e_i386.REG_EDI, "edi"),
+    (e_i386.REG_EIP, "eip"),
+    (e_i386.REG_EFLAGS, "eflags")
     ]
 
 #FIXME intel specific
@@ -39,21 +39,21 @@ def setRegs(emu, trace):
         tr = trace.getRegisterByName(name)
         emu.setRegister(idx, tr)
 
-def emulatorFromTraceSnapshot(tsnap):
+def emulatorFromTrace(trace):
     """
     Produce an envi emulator for this tracer object.  Use the trace's arch
     info to get the emulator so this can be done on the client side of a remote
     vtrace session.
     """
-    arch = tsnap.getMeta("Architecture")
+    arch = trace.getMeta("Architecture")
     amod = envi.getArchModule(arch)
     emu = amod.getEmulator()
 
-    if tsnap.getMeta("Platform") == "Windows":
-        emu.setSegmentInfo(e_intel.SEG_FS, tsnap.getThreads()[tsnap.getMeta("ThreadId")], 0xffffffff)
+    if trace.getMeta("Platform") == "Windows":
+        emu.setSegmentInfo(e_i386.SEG_FS, trace.getThreads()[trace.getMeta("ThreadId")], 0xffffffff)
 
-    emu.setMemoryObject(tsnap)
-    setRegs(emu, tsnap)
+    emu.setMemoryObject(trace)
+    setRegs(emu, trace)
     return emu
 
 def lockStepEmulator(emu, trace):
@@ -74,6 +74,65 @@ def lockStepEmulator(emu, trace):
             print "Lockstep Error: %s" % msg
             return
 
+import vtrace
+import vtrace.platforms.base as v_base
+
+class TraceEmulator(vtrace.Trace, v_base.TracerBase):
+    """
+    Wrap an arbitrary emulator in a Tracer compatible API.
+    """
+    def __init__(self, emu):
+        vtrace.Trace.__init__(self)
+        v_base.TracerBase.__init__(self)
+        self.emu = emu
+
+        # Fake out being attached
+        self.attached = True
+        self.pid = 0x56
+
+        self.setRegisterInfo(emu.getRegisterInfo())
+
+    def platformStepi(self):
+        self.emu.stepi()
+
+    def platformWait(self):
+        # We only support single step events now
+        return True
+
+    def archGetRegCtx(self):
+        return self.emu
+
+    def platformGetRegCtx(self, threadid):
+        return self.emu
+
+    def platformSetRegCtx(self, threadid, ctx):
+        self.setRegisterSnap(ctx.getRegisterSnap())
+
+    def platformProcessEvent(self, event):
+        self.fireNotifiers(vtrace.NOTIFY_STEP)
+
+    def platformReadMemory(self, va, size):
+        return self.emu.readMemory(va, size)
+
+    def platformWriteMemory(self, va, bytes):
+        return self.emu.writeMemory(va, bytes)
+
+    def platformGetMaps(self):
+        return self.emu.getMemoryMaps()
+
+    def platformGetThreads(self):
+        return {1:0xffff0000,}
+
+    def platformGetFds(self):
+        return [] #FIXME perhaps tie this into magic?
+
+    def getStackTrace(self):
+        # FIXME i386...
+        return [(self.emu.getProgramCounter(), 0), (0,0)]
+
+    def platformDetach(self):
+        pass
+
 def main():
     import vtrace
     sym = sys.argv[1]
@@ -86,7 +145,7 @@ def main():
         t.run()
     snap = t.takeSnapshot()
     #snap.saveToFile("woot.snap") # You may open in vdb to follow along
-    emu = emulatorFromTraceSnapshot(snap)
+    emu = emulatorFromTrace(snap)
     lockStepEmulator(emu, t)
 
 if __name__ == "__main__":

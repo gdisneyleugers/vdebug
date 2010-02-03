@@ -181,10 +181,10 @@ cmap = { 4: red,
 def spacesForMaps(mapobj):
     """
     Return a set of "spaces" for each of the maps
-    returned by the getMaps() api (for emu or trace).
+    returned by the getMemoryMaps() api (for emu or trace).
     """
     spaces = []
-    for base,size,perms,fname in mapobj.getMaps():
+    for base,size,perms,fname in mapobj.getMemoryMaps():
         spaces.append((base,size,cmap.get(perms, yellow),fname))
     return spaces
 

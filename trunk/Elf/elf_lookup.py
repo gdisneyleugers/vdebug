@@ -81,7 +81,8 @@ EM_ALPHA = 0x9026
 # for now...
 e_machine_32 =  (
                 EM_386,
-                EM_PPC
+                EM_PPC,
+                EM_ARM,
                 )
 e_machine_64 =  (
                 EM_PPC64,

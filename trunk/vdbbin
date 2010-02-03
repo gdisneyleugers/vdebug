@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 
-import vdb
-import vtrace
-import cobra
+import os
 import sys
 import getopt
 import traceback
+import threading
+
+import vdb
+import vtrace
+import cobra
 
 def usage():
     print "Usage: vdb [options]"
@@ -53,12 +56,18 @@ if __name__ == "__main__":
             vtrace.verbose = True
             cobra.verbose = True
 
-    trace = vtrace.getTrace()
-
     if snapshot != None:
         trace = vtrace.TraceSnapshot(snapshot)
+    else:
+        trace = vtrace.getTrace()
 
     db = vdb.Vdb(trace)
+    if do_gui:
+        import vwidget.main as vw_main
+        import vdb.gui
+        vw_main.mainthread()
+        vgui = vdb.gui.VdbGui(db)
+
     if pid != None:
         trace.attach(pid)
 
@@ -66,23 +75,23 @@ if __name__ == "__main__":
         trace.execute(cmd)
 
     if do_gui:
-        import vdb.gui
-        vdb.gui.domain(db)
+
+        vw_main.main()
 
     else:
-        cli = vdb.VdbCli(db)
-        while True:
+
+        while not db.shutdown.isSet():
             try:
-                cli.cmdloop()
+
+                db.cmdloop()
 
             except KeyboardInterrupt:
-                trace = db.getTrace()
-                if trace:
-                    trace.sendBreak()
-                break
+                if db.trace.isRunning():
+                    db.trace.sendBreak()
 
             except SystemExit:
                 break
 
             except:
                 traceback.print_exc()
+

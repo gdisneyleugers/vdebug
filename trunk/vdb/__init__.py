@@ -1,6 +1,6 @@
 import os
 import sys
-import code
+import pprint
 import signal
 import string
 import traceback
@@ -18,12 +18,20 @@ import vtrace.util as v_util
 import vtrace.notifiers as v_notif
 
 import vdb
-import vdb.formatters as fmt
 import vdb.extensions as v_ext
 
 import envi
+import envi.cli as e_cli
+import envi.bits as e_bits
+import envi.memory as e_mem
+import envi.config as e_config
+import envi.resolver as e_resolv
+import envi.memcanvas as e_canvas
+
+from envi.threads import firethread
 
 import vstruct
+import vstruct.primitives as vs_prims
 
 vdb.basepath = vdb.__path__[0] + "/"
 
@@ -48,904 +56,122 @@ class ScriptThread(Thread):
         try:
             exec(self.cobj, self.locals)
         except Exception, e:
+            traceback.print_exc()
             print "Script Error: ",e
 
-class CliExtMeth:
+class VdbTrace:
     """
-    This is used to work around the difference
-    between functions and bound methods for extended
-    command modules
+    Used to hand thing that need a persistant reference to a trace
+    when using vdb to manage tracers.
     """
-    def __init__(self, vdb, func):
-        self.vdb = vdb
-        self.func = func
-        self.__doc__ = func.__doc__
+    def __init__(self, db):
+        self.db = db
 
-    def __call__(self, line):
-        return self.func(self.vdb, line)
+    def attach(self, pid):
+        # Create a new tracer for the debugger and attach.
+        trace = self.db.newTrace()
+        trace.attach(pid)
 
-class VdbCli(Cmd,v_notif.Notifier):
+    # Take over all notifier registration
+    def registerNotifier(self, event, notif):
+        self.db.registerNotifier(event, notif)
 
-    """
-    The command object used by the VDB command line interface
-    """
+    def deregisterNotifier(self, event, notif):
+        self.db.deregisterNotifier(event, notif)
 
-    def __init__(self, myvdb, stdin=sys.stdin, stdout=sys.stdout):
-        Cmd.__init__(self, stdin=stdin, stdout=stdout)
-        v_notif.Notifier.__init__(self)
-        self.vdb = myvdb
-        self.prompt = "vdb > "
-        self.banner = "Welcome To VDB!\n"
-        self.vcmds = {}
-        self.vdb.registerNotifier(vtrace.NOTIFY_ALL, self)
+    #FIXME should we add modes to this?
 
-    def do_config(self, line):
-        """
-        Show or edit a vdb config option from the command line
-
-        Usage: config [-S section] [option=value]
-        """
-        argv = v_util.splitargs(line)
-        secname = None
-        try:
-            opts,args = getopt(argv, "S:")
-            for opt,optarg in opts:
-                if opt == "-S":
-                    secname = optarg
-
-        except Exception, e:
-            print e
-            return self.do_help("config")
-
-        if len(args) > 1:
-            return self.do_help("config")
-
-        if len(args) == 0:
-            if secname != None:
-                secs = [secname,]
-            else:
-                secs = self.vdb.config.sections()
-
-            for secname in secs:
-                self.vdb.vprint("")
-                self.vdb.vprint("[%s]" % secname)
-                for oname in self.vdb.config.options(secname):
-                    val = self.vdb.config.get(secname, oname)
-                    self.vdb.vprint("%s=%s" % (oname, val))
-
-        else:
-            if secname == None:
-                secname = ""
-            key,val = args[0].split("=",1)
-            self.vdb.config.set(secname, key, val)
-            self.vdb.vprint("[%s] %s = %s" % (secname,key,val))
-
-        #import vwidget.config as vw_config
-        #x = vw_config.ConfigDialog(self.vdb.config)
-        #x.show()
-
-    def do_alias(self, line):
-        """
-        Add an alias to the command line interpreter's aliases dictionary
-
-        Usage: alias <alias_word> rest of the alias command
-        To delete an alias:
-        Usage: alias <alias_word>
-        """
-        if len(line):
-            row = line.split(None, 1)
-            if len(row) == 1:
-                self.vdb.delConfig("Aliases",row[0])
-            else:
-                self.vdb.setConfig("Aliases",row[0],row[1])
-
-        self.vdb.vprint("Current Aliases:\n")
-        for a,v in self.vdb.getConfigSection("Aliases").items():
-            self.vdb.vprint("%s -> %s" % (a,v))
-        self.vdb.vprint("")
-        return
-
-    def get_names(self):
-        ret = []
-        ret.extend(Cmd.get_names(self))
-        ret.extend(self.vdb.extcmds.keys())
-        return ret
+    def selectThread(self, threadid):
+        #FIXME perhaps a thread selected LOCAL event?
+        trace = self.db.getTrace()
+        trace.selectThread(threadid)
+        self.db.fireLocalNotifiers(vtrace.NOTIFY_BREAK, trace)
 
     def __getattr__(self, name):
-        func = self.vdb.extcmds.get(name, None)
-        if func == None:
-            raise AttributeError
-        return CliExtMeth(self.vdb, func)
+        return getattr(self.db.getTrace(), name)
 
-    def precmd(self, line):
-        for k,v in self.vdb.getConfigSection("Aliases").items():
-            if line.startswith(k):
-                line = line.replace(k, v)
-        return line
+defconfig = """
+[Vdb]
 
-    def onecmd(self, line):
-        try:
-            Cmd.onecmd(self, line)
-        except SystemExit:
-            raise
-        except Exception, msg:
-            #traceback.print_exc()
-            self.vdb.vprint("ERROR: %s" % msg)
+[RegisterView]
+i386=eax,ebx,ecx,edx,esi,edi,eip,esp,ebp,eflags,ds,es,cs,fs,gs,ss
+x64=rax,rbx,rcx,rdx,rsi,rdi,rip,rsp,rbp,r8,r9,r10,r11,r12,r13,r14,r15
 
-    def do_vstruct(self, line):
-        """
-        List the available structure modules and optionally
-        structure definitions from a particular module in the
-        current vstruct.
-
-        Usage: vstruct [modname]
-        """
-        if len(line) == 0:
-            self.vdb.vprint("\nVStruct Modules:")
-            plist = vstruct.getModuleNames()
-        else:
-            self.vdb.vprint("\nKnown Structures:")
-            plist = vstruct.getStructNames(line)
-
-        for n in plist:
-            self.vdb.vprint(n)
-        self.vdb.vprint("\n")
-
-    def do_dis(self, line):
-        """
-        Print out the opcodes for a given address expression
-
-        Usage: dis <address expression>
-        """
-        if len(line) == 0:
-            return self.do_help("dis")
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        addr = t.parseExpression(line)
-        mem = t.readMemory(addr, 256)
-        offset = 0
-        count = 0
-        self.vdb.vprint("Dissassembly:")
-        while offset < 255 and count < 20:
-            va = addr + offset
-            op = self.vdb.arch.makeOpcode(mem[offset:])
-            self.vdb.vprint("0x%.8x: %s" % (va,self.vdb.arch.reprOpcode(op, va=va)))
-            offset += len(op)
-            count += 1
-
-    def do_maps(self, line):
-        """
-        Display all the current memory maps.
-
-        Usage: maps
-        """
-        t = self.vdb.getTrace()
-        self.vdb.vprint("[ address ] [ size ] [ perms ] [ File ]")
-        for addr,size,perm,fname in t.getMaps():
-            self.vdb.vprint("0x%.8x\t%d\t%s\t%s" % (addr,size,perm,fname))
-
-    def do_memdump(self, line):
-        """
-        Dump process memory out to a file.
-
-        Usage: memdump <addr_expression> <size_expression> <filename>
-        """
-        if len(line) == 0:
-            return self.do_help("memdump")
-
-        argv = v_util.splitargs(line)
-        if len(argv) != 3:
-            return self.do_help("memdump")
-
-        t = self.vdb.getTrace()
-        addr = t.parseExpression(argv[0])
-        size = t.parseExpression(argv[1])
-
-        mem = t.readMemory(addr, size)
-        file(argv[2], "wb").write(mem)
+[Aliases]
+<f1>=stepi
+<f2>=go -I 1
+<f5>=go
+"""
         
-    def do_mem(self, line):
-        """
-        Show some memory (with optional formatting and size)
-
-        Usage: mem [-F <formatter>] <addr expression> [size]
-
-        NOTE: use -F ? for a list of the formatters
-        """
-        fmtname = "Bytes"
-
-        if len(line) == 0:
-            return self.do_help("mem")
-
-        argv = v_util.splitargs(line)
-        try:
-            opts,args = getopt(argv, "F:")
-        except:
-            return self.do_help("mem")
-
-        for opt,optarg in opts:
-            if opt == "-F":
-                fmtname = optarg
-                if fmtname == "?":
-                    self.vdb.vprint("Registered Formatters:")
-                    for name in self.vdb.getFormatNames():
-                        self.vdb.vprint(name)
-                    return
-
-        t = self.vdb.getTrace()
-        size = 256
-        addr = t.parseExpression(args[0])
-        if len(args) == 2:
-            size = int(args[1], 0)
-
-        bytes = t.readMemory(addr, size)
-        abuf,dbuf,cbuf = self.vdb.doFormat(fmtname, addr, bytes)
-        alines = abuf.split("\n")
-        dlines = dbuf.split("\n")
-        clines = cbuf.split("\n")
-        for i in xrange(len(alines)):
-            self.vdb.vprint("%s  %s  %s" % (alines[i],dlines[i],clines[i]))
-
-    def do_python(self, line):
-        """
-        Start an interactive python interpreter with the following
-        objects mapped into the namespace:
-        vtrace - The Vtrace Module
-        vdb    - The Vdb Module
-        db     - The debugger instance
-        trace  - The current tracer
-
-        Usage: python
-        """
-        local = {"vtrace":vtrace,
-                  "vdb":vdb,
-                  "db":self.vdb,
-                  "trace":self.vdb.getTrace()}
-        code.interact(local=local)
-
-    def do_struct(self, args):
-        """
-        Break out a strcuture from memory.  You may use the command
-        "vstruct" to show the known structures in vstruct.
-
-        Usage: struct <StructName> <vtrace expression>
-        """
-        try:
-            clsname, vexpr = v_util.splitargs(args)
-        except:
-            return self.do_help("struct")
-
-        t = self.vdb.getTrace()
-
-        addr = t.parseExpression(vexpr)
-        s = t.getStruct(clsname, addr)
-        self.vdb.vprint(repr(s))
-
-    def notify(self, event, trace):
-        """
-        Some CLI notifiers for printing out debugger events.
-        """
-
-        pid = trace.getPid()
-
-        if event == vtrace.NOTIFY_ATTACH:
-            self.vdb.vprint("Attached to : %d" % pid)
-
-        elif event == vtrace.NOTIFY_CONTINUE:
-            pass
-            #self.vdb.vprint("PID %d continuing" % pid
-
-        elif event == vtrace.NOTIFY_DETACH:
-            self.vdb.vprint("Detached from %d" % pid)
-
-        elif event == vtrace.NOTIFY_SIGNAL:
-            win32 = trace.getMeta("Win32Event", None)
-            if win32:
-                code = win32.get("ExceptionCode", 0)
-                addr = win32.get("ExceptionAddress")
-                chance = 2
-                if win32.get("FirstChance", False):
-                    chance = 1
-                self.vdb.vprint("Win32 Exception: 0x%.8x at 0x%.8x (%d chance)" % (code, addr, chance))
-            else:
-                self.vdb.vprint("Process Recieved Signal %d" % trace.getMeta("PendingSignal"))
-
-        elif event == vtrace.NOTIFY_BREAK:
-            pc = trace.getProgramCounter()
-            bp = trace.breakpoints.get(pc, None)
-            if bp:
-                self.vdb.vprint("Hit Break: %s" % repr(bp))
-
-        elif event == vtrace.NOTIFY_EXIT:
-            self.vdb.vprint("PID %d exited: %d" % (pid,trace.getMeta("ExitCode")))
-
-        elif event == vtrace.NOTIFY_LOAD_LIBRARY:
-            self.vdb.vprint("Loading Binary: %s" % trace.getMeta("LatestLibrary",None))
-
-        elif event == vtrace.NOTIFY_CREATE_THREAD:
-            self.vdb.vprint("New Thread: %d" % trace.getMeta("ThreadId"))
-
-        elif event == vtrace.NOTIFY_EXIT_THREAD:
-            self.vdb.vprint("Exit Thread: %d" % trace.getMeta("ThreadId"))
-
-        elif event == vtrace.NOTIFY_DEBUG_PRINT:
-            s = "<unknown>"
-            win32 = trace.getMeta("Win32Event", None)
-            if win32:
-                s = win32.get("DebugString", "<unknown>")
-            self.vdb.vprint("DEBUG PRINT: %s" % s)
-
-    def do_writemem(self, args):
-        """
-        Over-write some memory in the target address space.
-        Usage: writemem <addr expression> <py string>
-        NOTE: do NOT have any whitspace in addr-expression until I get off
-        my ass a write a good parser
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        addr,buf = args.split(None, 1)
-        addr = t.parseExpression(addr)
-        buf = eval(buf)
-        t.writeMemory(addr, buf)
-
-    def do_signal(self, args):
-        """
-        Show or set the current pending signal (this is ONLY relavent on POSIX signaling
-        systems).
-
-        Usage: signal [newsigno]
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        cursig = t.getMeta("PendingSignal", 0)
-        self.vdb.vprint("Current signal: %d" % cursig)
-        if args:
-            newsig = int(args)
-            t.setMeta("PendingSignal", newsig)
-            self.vdb.vprint("New signal: %d" % newsig)
-
-    def do_snapshot(self, line):
-        """
-        Take a process snapshot of the current (stopped) trace and
-        save it to the specified file.
-
-        Usage: snapshot <filename>
-        """
-        if len(line) == 0:
-            return self.do_help("snapshot")
-        alist = v_util.splitargs(line)
-        if len(alist) != 1:
-            return self.do_help("snapshot")
-
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        print "Taking Snapshot"
-        snap = t.takeSnapshot()
-        print "Saving To File"
-        snap.saveToFile(alist[0])
-        print "Done"
-
-    def do_script(self, text):
-        """
-        Execute a vscript file.
-
-        The vscript file is arbitrary python code which is run with
-        the trace, vdb, vtrace, and optional arguments mapped in as locals.
-
-        Usage: script <scriptfile> [...script args...]
-        """
-        args = text.split()
-        if len(args) == 0:
-            return self.do_help("script")
-        filename = ""
-        for i in range(len(args)):
-            filename = string.join(args[:i+1])
-            if os.path.exists(filename):
-                args = args[i+1:]
-                break
-
-        self.vdb.script(filename, args)
-
-    def do_ignore(self, args):
-        """
-        Add the specified signal id (exception id for windows) to the ignored
-        signals list for the current trace.  This will make the smallest possible
-        performance impact for that particular signal but will also not alert
-        you that it has occured.
-
-        Usage: ignore [[-d] <sigcode>]
-        """
-        #FIXME make a good arg parser
-        t = self.vdb.getTrace()
-        alist = v_util.splitargs(args)
-        if len(alist) == 1:
-            sigid = int(args, 0)
-            self.vdb.vprint("ADDING 0x%.8x to the ignores list" % sigid)
-            t.addIgnoreSignal(sigid)
-        elif len(alist) == 2 and alist[0] == "-d":
-            sigid = int(alist[1], 0)
-            t.delIgnoreSignal(sigid)
-        else:
-            ilist = t.getMeta("IgnoredSignals")
-            self.vdb.vprint("Currently Ignored Signals/Exceptions:")
-            for x in ilist:
-                self.vdb.vprint("0x%.8x" % x)
-
-    def do_exec(self, string):
-        """
-        Execute a program with the given command line and
-        attach to it.
-        Usage: exec </some/where and some args>
-        """
-        t = self.vdb.newTrace()
-        t.execute(string)
-
-    def do_threads(self, line):
-        """
-        List the current threads in the target process or select
-        the current thread context for the target tracer.
-        Usage: thread [thread id]
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-
-        if len(line) > 0:
-            thrid = int(line, 0)
-            t.selectThread(thrid)
-
-        self.vdb.vprint("Current Threads:")
-        self.vdb.vprint("(thrid -> thrinfo)")
-        tid = t.getMeta("ThreadId")
-        for key,val in t.getThreads().items():
-            a = " "
-            if key == tid:
-                a = "*"
-            self.vdb.vprint("%s%s -> 0x%.8x" % (a, key, val))
-
-    def do_mode(self, args):
-        """
-        Set modes in the tracers...
-        mode Foo=True/False
-        """
-        t = self.vdb.getTrace()
-        if args:
-            mode,val = args.split("=")
-            newmode = eval(val)
-            self.vdb.setMode(mode, newmode)
-        else:
-            for key,val in t.modes.items():
-                self.vdb.vprint("%s -> %d" % (key,val))
-
-    def do_regs(self, args):
-        """
-        Show *all* the current registers.
-        FIXME: This needs some prettifying
-
-        Usage: regs
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        regs = t.getRegisters()
-        rnames = regs.keys()
-        rnames.sort()
-        for r in rnames:
-            self.vdb.vprint("%s 0x%.8x" % (r, regs[r]))
-
-    def do_stepi(self, args):
-        """
-        Single step the target tracer.
-        Usage: stepi [count expression]
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        if len(args):
-            count = t.parseExpression(args)
-        else:
-            count = 1
-
-        for i in xrange(count):
-            t.stepi()
-
-    def do_go(self, line):
-        """
-        Continue the target tracer.
-        -I go icount linear instructions forward (step over style)
-        -U go *out* of fcount frames (step out style)
-        <until addr> go until explicit address
-
-        Usage: go [-U <fcount> | -I <icount> | <until addr expression>]
-        """
-        until = None
-        icount = None
-        fcount = None
-
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        argv = v_util.splitargs(line)
-        try:
-            opts,args = getopt(argv, "U:I:")
-        except:
-            return self.do_help("go")
-
-        for opt,optarg in opts:
-            if opt == "-U":
-                if len(optarg) == 0: return self.do_help("go")
-                fcount = t.parseExpression(optarg)
-            elif opt == "-I":
-                if len(optarg) == 0: return self.do_help("go")
-                icount = t.parseExpression(optarg)
-
-        if icount != None:
-            addr = t.getProgramCounter()
-            for i in xrange(icount):
-                addr += len(self.vdb.arch.makeOpcode(t.readMemory(addr, 16)))
-            until = addr
-        elif fcount != None:
-            until = t.getStackTrace()[fcount][0]
-        elif len(args):
-            until = t.parseExpression(args[0])
-
-        if not until:
-            self.vdb.vprint("Running Tracer (use 'break' to stop it)")
-        t.run(until=until)
-
-    def do_server(self, port):
-        """
-        Start a vtrace server on the local box
-        optionally specify the port
-
-        Usage: server [port]
-        """
-        if port:
-            vtrace.port = int(port)
-
-        vtrace.startVtraceServer()
-
-    def do_syms(self, args):
-        """
-        List symbols and by file.
-
-        Usage: syms [filename]
-
-        With no arguments, syms will self.vdb.vprint(the possible
-        libraries with symbol resolvers.  Specify a library
-        to see all the symbols for it.
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        if len(args) == 0:
-            self.vdb.vprint("Current Library Symbol Resolvers:")
-            for libname in t.getNormalizedLibNames():
-                self.vdb.vprint("  %s" % libname)
-        else:
-            self.vdb.vprint("Symbols From %s:" % args)
-            for sym in t.getSymsForFile(args):
-                self.vdb.vprint("0x%.8x %s" % (sym.value, repr(sym)))
-
-    def do_call(self, string):
-        """
-        Allows a C-like syntax for calling functions inside
-        the target process (from his context).
-        Example: call printf("yermom %d", 10)
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        ind = string.index("(")
-        if ind == -1:
-            raise Exception('ERROR - call wants c-style syntax: ie call printf("yermom")')
-        funcaddr = t.parseExpression(string[:ind])
-
-        try:
-            args = eval(string[ind:])
-        except:
-            raise Exception('ERROR - call wants c-style syntax: ie call printf("yermom")')
-
-        self.vdb.vprint("calling %s -> 0x%.8x" % (string[:ind], funcaddr))
-        t.call(funcaddr, args)
-
-    def do_bestname(self, args):
-        """
-        Return the "best name" string for an address.
-
-        Usage: bestname <vtrace expression>
-        """
-        if len(args) == 0:
-            return self.do_help("bestname")
-        t = self.vdb.getTrace()
-        addr = t.parseExpression(args)
-        self.vdb.vprint(self.vdb.bestName(addr))
-
-    def do_EOF(self, string):
-        self.vdb.vprint("No.. this is NOT a python interpreter... use quit ;)")
-
-    def do_quit(self,args):
-        """
-        Quit VDB
-        """
-        t = self.vdb.getTrace()
-        if t.isAttached():
-            self.vdb.vprint("Detaching...")
-            t.detach()
-        self.vdb.vprint("Exiting...")
-        sys.exit(0)
-
-    def do_detach(self, args):
-        """
-        Detach from the current tracer
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        t.detach()
-
-    def do_attach(self, args):
-        """
-        Attach to a process by PID
-        usage: attach <pid>
-        """
-        pid = int(args)
-        self.vdb.vprint("Attaching to ",pid)
-        self.vdb.newTrace().attach(pid)
-
-    def emptyline(self):
-        self.do_help("")
-
-    def do_sections(self, args):
-        self.vdb.vprint("TEMPORARILY BROKEN WHILE I REDO THE BINARY PARSERS")
-
-    def do_bt(self, line):
-        """
-        Show a stack backtrace for the currently selected thread.
-
-        Usage: bt
-        """
-        self.vdb.vprint("[   PC   ] [ Frame  ] [ Location ]")
-        t = self.vdb.getTrace()
-        for frame in t.getStackTrace():
-            self.vdb.vprint("0x%.8x 0x%.8x %s" % (frame[0],frame[1],self.vdb.bestName(frame[0])))
-
-    def do_lm(self, args):
-        """
-        Show the loaded libraries and their base addresses.
-
-        Usage: lm
-        """
-        t = self.vdb.getTrace()
-        bases = t.getMeta("LibraryBases")
-        self.vdb.vprint("Loaded Libraries:")
-        names = t.getNormalizedLibNames()
-        names.sort()
-        for libname in names:
-            base = bases.get(libname, -1)
-            self.vdb.vprint("0x%.8x - %s" % (base, libname))
-
-    def do_bpfile(self, line):
-        """
-        Set the python code for a breakpoint from the contents
-        of a file.
-
-        Usage: bpfile <bpid> <filename>
-        """
-        argv = v_util.splitargs(line)
-        if len(argv) != 2:
-            return self.do_help("bpfile")
-
-        bpid = int(argv[0])
-        pycode = file(argv[1], "rU").read()
-
-        t = self.vdb.getTrace()
-        t.setBreakpointCode(bpid, pycode)
-
-    def do_bpedit(self, line):
-        """
-        Manipulcate the python code that will be run for a given
-        breakpoint by ID.  (Also the way to view the code).
-
-        Usage: bpedit <id> [optionally new code]
-        """
-        argv = v_util.splitargs(line)
-        if len(argv) == 0:
-            return self.do_help("bpedit")
-        t = self.vdb.getTrace()
-        bpid = int(argv[0])
-
-        if len(argv) == 2:
-            t.setBreakpointCode(bpid, argv[1])
-
-        pystr = t.getBreakpointCode(bpid)
-        self.vdb.vprint("[%d] Breakpoint code: %s" % (bpid,pystr))
-
-    def do_bp(self, line):
-        """
-        Show, add,  and enable/disable breakpoints
-        USAGE: bp [-d <addr>] [-a <addr>] [-o <addr>] [[-c pycode] <address> ...]
-        -C - Clear All Breakpoints
-        -c "py code" - Set the breakpoint code to the given python string
-        -d <id> - Disable Breakpoint
-        -e <id> - Enable Breakpoint
-        -r <id> - Remove Breakpoint
-        -o <addr> - Create a OneTimeBreak
-        -L <libname> - Add bp's to all functions in <libname>
-        -F <filename> - Load bpcode from file
-        <address>... - Create Breakpoint
-
-        NOTE: -c adds python code to the breakpoint.  The python code will
-            be run with the following objects mapped into it's namespace
-            automagically:
-                vtrace  - the vtrace package
-                trace   - the tracer
-                bp      - the breakpoint object
-        """
-        argv = v_util.splitargs(line)
-        opts,args = getopt(argv, "F:e:d:o:r:L:Cc:")
-        t = self.vdb.getTrace()
-        pycode = None
-
-        for opt,optarg in opts:
-            if "-e" in opt:
-                t.setBreakpointEnabled(eval(optarg), True)
-
-            if "-c" in opt:
-                pycode = optarg
-                test = compile(pycode, "test","exec")
-
-            elif "-F" in opt:
-                pycode = file(optarg, "rU").read()
-
-            elif "-r" in opt:
-                t.removeBreakpoint(eval(optarg))
-
-            elif "-C" in opt:
-                for bp in t.getBreakpoints():
-                    t.removeBreakpoint(bp.id)
-
-            elif "-d" in opt:
-                t.setBreakpointEnabled(eval(optarg), False)
-
-            elif "-o" in opt:
-                t.addBreakpoint(vtrace.OneTimeBreak(None, expression=optarg))
-
-            elif "-L" in opt:
-                for sym in t.getSymsForFile(optarg):
-                    if sym.stype != vtrace.SYM_FUNCTION:
-                        continue
-                    try:
-                        bp = vtrace.Breakpoint(None, expression="%s.%s" % (optarg,str(sym)))
-                        bp.setBreakpointCode(pycode)
-                        t.addBreakpoint(bp)
-                        self.vdb.vprint("Added: %s" % str(sym))
-                    except Exception, msg:
-                        self.vdb.vprint("WARNING: %s" % str(msg))
-
-        for arg in args:
-            bp = vtrace.Breakpoint(None, expression=arg)
-            bp.setBreakpointCode(pycode)
-            t.addBreakpoint(bp)
-
-        self.vdb.vprint(" [ Breakpoints ]")
-        for bp in t.getBreakpoints():
-            self.vdb.vprint("%s enabled: %s" % (bp, bp.isEnabled()))
-
-    def do_fds(self, args):
-        """
-        Show all the open Handles/FileDescriptors for the target process.
-        The "typecode" shown in []'s is the vtrace typecode for that kind of
-        fd/handle.
-
-        Usage: fds
-        """
-        t = self.vdb.getTrace()
-        t.requireAttached()
-        for id,fdtype,fname in t.getFds():
-            self.vdb.vprint("0x%.8x [%d] %s" % (id,fdtype,fname))
-
-    def do_ps(self, args):
-        """
-        Show the current process list.
-
-        Usage: ps
-        """
-        trace = self.vdb.getTrace()
-        self.vdb.vprint("[Pid]\t[ Name ]")
-        for ps in trace.ps():
-            self.vdb.vprint("%s\t%s" % (ps[0],ps[1]))
-
-    def do_break(self, args):
-        """
-        Send the break signal to the target tracer to stop
-        it's execution.
-
-        Usage: break
-        """
-        self.vdb.getTrace().sendBreak()
-
-    def do_meta(self, string):
-        """
-        Show the metadata for the current trace
-        """
-        self.vdb.vprint(repr(self.vdb.getTrace().metadata))
-
-class Vdb(v_notif.Notifier, v_util.TraceManager):
+class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
 
     """
     A VDB object is a debugger object which may be used to embed full
     debugger like functionality into a python application.  The
-    Vdb object implements many useful utilities and may in most cases
-    be treated like a vtrace tracer object due to __getattr__ overrides.
+    Vdb object contains a CLI impelementation which extends envi.cli>
     """
 
     def __init__(self, trace=None):
         v_notif.Notifier.__init__(self)
         v_util.TraceManager.__init__(self)
 
-        self.stdout = sys.stdout
-        self.stderr = sys.stderr
-
         if trace == None:
             trace = vtrace.getTrace()
 
         arch = trace.getMeta("Architecture")
         self.arch = envi.getArchModule(arch)
+        self.difftracks = {}
 
         self.setMode("NonBlocking", True)
 
         self.manageTrace(trace)
         self.registerNotifier(vtrace.NOTIFY_ALL, self)
 
-        if vtrace.verbose:
-            self.registerNotifier(vtrace.NOTIFY_ALL, vtrace.VerboseNotifier())
+        # FIXME if config verbose
+        #self.registerNotifier(vtrace.NOTIFY_ALL, vtrace.VerboseNotifier())
 
-        self.config = ConfigParser()
-        # FIXME search pwd/home/lib/something/
-        vdbhome = None
-        configs = [os.path.join(vdb.basepath,"configs","vdb.conf"),]
-        if sys.platform == "win32":
-            homepath = os.getenv("HOMEPATH")
-            homedrive = os.getenv("HOMEDRIVE")
-            if homedrive != None and homepath != None:
-                vdbhome = os.path.join(homedrive,homepath,".vdb")
-        else:
-            home = os.getenv("HOME")
-            if home != None:
-                vdbhome = os.path.join(home, ".vdb")
+        self.vdbhome = e_config.gethomedir(".vdb")
 
-        # The first run...
-        if vdbhome != None:
-            if not os.path.exists(vdbhome):
-                os.mkdir(vdbhome)
-                os.mkdir(os.path.join(vdbhome,"modules"))
-                cfg = file(configs[0], "r").read()
-                file(os.path.join(vdbhome,"vdb.conf"), "w").write(cfg)
-
-            configs.append(os.path.join(vdbhome, "vdb.conf"))
-
-        self.config.read(configs)
-
-        self.formatters = {}
-        self.breaktypes = {}
-        self.formatnames = []
-        self.extcmds = {}
+        self.loadConfig()
 
         self.setupSignalLookups()
 
-        self.registerBreaktype("Breakpoint", vtrace.Breakpoint)
-        self.registerBreaktype("One Time Break", vtrace.OneTimeBreak)
-        self.registerBreaktype("Tracker Breakpoint", vtrace.TrackerBreak)
+        # Ok... from here down we're handing everybody the crazy
+        # on-demand-resolved trace object.
+        trace = vdb.VdbTrace(self)
+        e_cli.EnviMutableCli.__init__(self, trace, self.config, symobj=trace)
 
-        fmt.setupFormatters(self)
+        self.prompt = "vdb > "
+        self.banner = "Welcome To VDB!\n"
+
+        self.loadDefaultRenderers(trace)
         self.loadExtensions(trace)
-        if vdbhome != None:
-            self.loadModules(vdbhome)
 
-    def vprint(self, msg, addnl=True):
-        if addnl:
-            msg += "\n"
-        self.stdout.write(msg)
+    def loadConfig(self):
+        cfgfile = None
+        if self.vdbhome != None:
+            if not os.path.exists(self.vdbhome):
+                os.mkdir(self.vdbhome)
+            cfgfile = os.path.join(self.vdbhome, "vdb.conf")
+
+        self.config = e_config.EnviConfig(filename=cfgfile, defaults=defconfig)
+
+    def loadDefaultRenderers(self, trace):
+        import envi.memcanvas.renderers as e_render
+        import vdb.renderers as v_rend
+        # FIXME check endianness
+        self.canvas.addRenderer("bytes", e_render.ByteRend())
+        self.canvas.addRenderer("u_int_16", e_render.ShortRend())
+        self.canvas.addRenderer("u_int_32", e_render.LongRend())
+        self.canvas.addRenderer("u_int_64", e_render.QuadRend())
+        self.canvas.addRenderer("disasm", v_rend.OpcodeRenderer(self.trace))
+        drend = v_rend.DerefRenderer(self.trace)
+        self.canvas.addRenderer("Deref View", drend)
 
     def verror(self, msg, addnl=True):
         if addnl:
             msg += "\n"
-        self.stderr.write(msg)
+        sys.stderr.write(msg)
 
     def loadExtensions(self, trace):
         """
@@ -953,15 +179,6 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
         platform/arch/etc...
         """
         v_ext.loadExtensions(self, trace)
-
-    def registerCmdExtension(self, func):
-        self.extcmds["do_%s" % func.__name__] = func
-
-    def initFromTrace(self, trace):
-        """
-        Do the necissary work to initialize vdb from a new tracer.
-        """
-        pass
 
     def getTrace(self):
         return self.trace
@@ -982,133 +199,6 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
         self.manageTrace(self.trace)
         return self.trace
 
-    def notify(self, event, trace):
-        # We don't really *need* this yet, but lets keep it around
-        pass
-
-    def loadModules(self, vdbdir):
-        """
-        Modules placed in HOME/.vdb/modules will be loaded
-        run with a reference to the vdb instance on load.
-        """
-        mdir = os.path.join(vdbdir, "modules")
-        self.vprint("Loading VDB Modules: ")
-        for name in os.listdir(mdir):
-            if not name.endswith(".py"):
-                continue
-            try:
-                self.script(os.path.join(mdir,name))
-                self.vprint(name+" ")
-            except Exception,msg:
-                self.verror("ERROR: %s: %s" % (name,msg))
-        self.vprint("... Complete")
-
-    def delConfig(self, section, option):
-        """
-        Delete a config option (use with extreeme caution).
-        """
-        self.config.remove_option(section, option)
-
-    def setConfig(self, section, option, value):
-        """
-        Set a vdb config option.
-        """
-        self.config.set(section, option, value)
-
-    def getConfigSection(self, section):
-        """
-        Get a python dictionary of a whole section of the config.
-        """
-        ret = {}
-        for opt in self.config.options(section):
-            ret[opt] = self.config.get(section,opt)
-        return ret
-
-    def getConfig(self, section, option, default):
-        """
-        Get a config option from a section as a string.
-        """
-        if not self.config.has_option(section, option):
-            return default
-        return self.config.get(section,option)
-
-    def getConfigInt(self, section, option, default):
-        """
-        Get a config option from a section as an int
-        """
-        if not self.config.has_option(section, option):
-            return default
-        return self.config.getint(section,option)
-
-    def getConfigBool(self, section, option, default):
-        """
-        Get a config option from a section as a boolean
-        """
-        if not self.config.has_option(section, option):
-            return default
-        return self.config.getbool(section,option)
-
-    def registerBreaktype(self, name, cls):
-        """
-        Register a breakpoint type for use in the breakpoint
-        management window.  cls specifies the class, whose constructor
-        *must* take address and expression just like the base Breakpoint
-        (ie. Breakpoint(<address>, expression=<expression>)).
-        """
-        self.breaktypes[name] = cls
-
-    def getBreakTypes(self):
-        """
-        Return the list of the currently register
-        breakpoint types
-        """
-        return self.breaktypes.keys()
-
-    def constructBreakpoint(self, typename, expression, enabled=True):
-        """
-        Construct a breakpoint of the type associated with the given
-        typename and for the address in "expression" and return it
-        """
-        cls = self.breaktypes.get(typename, None)
-        if not cls:
-            raise Expression("Unknown Breakpoint Type: %s" % typename)
-        bp = cls(None, expression=expression)
-        bp.setEnabled(enabled)
-        return bp
-
-    def vmemProtFormat(self, mask):
-        """
-        Return a printable repr for the protections specified
-        in mask
-        """
-        plist = ['-','-','-','-']
-        if mask & vtrace.MM_SHARED:
-            plist[0] = 's'
-        if mask & vtrace.MM_READ:
-            plist[1] = 'r'
-        if mask & vtrace.MM_WRITE:
-            plist[2] = 'w'
-        if mask & vtrace.MM_EXEC:
-            plist[3] = 'x'
-
-        return string.join(plist,"")
-
-    def registerFormatter(self, name, formater):
-        """
-        A "formatter"
-        """
-        self.formatnames.append(name)
-        self.formatters[name] = formater
-
-    def getFormatNames(self):
-        return self.formatnames
-
-    def doFormat(self, name, address, memory):
-        formater = self.formatters.get(name,None)
-        if not formater:
-            raise Exception("ERROR - Invalid formater: %s" % name)
-        return formater.format(address,memory)
-
     def setupSignalLookups(self):
         self.siglookup = VdbLookup()
 
@@ -1127,7 +217,12 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
     def parseExpression(self, exprstr):
         return self.trace.parseExpression(exprstr)
 
-    def bestName(self, address):
+    def getExpressionLocals(self):
+        r = vtrace.VtraceExpressionLocals(self.trace)
+        r["db"] = self
+        return r
+
+    def reprPointer(self, address):
         """
         Return a string representing the best known name for
         the given address
@@ -1135,14 +230,25 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
         if not address:
             return "NULL"
 
-        match = self.trace.getSymByAddr(address)
-        if match != None:
-            if long(match) == address:
-                return repr(match)
-            else:
-                return "%s+%d" % (repr(match), address - long(match))
+        # Do we have a symbol?
+        sym = self.trace.getSymByAddr(address, exact=False)
+        if sym != None:
+            return "%s + %d" % (repr(sym),address-long(sym))
 
-        map = self.trace.getMap(address)
+        # Check if it's a thread's stack
+        for tid,tinfo in self.trace.getThreads().items():
+            ctx = self.trace.getRegisterContext(tid)
+            sp = ctx.getStackCounter()
+            stack,size,perms,fname = self.trace.getMemoryMap(sp)
+            if address >= stack and address < (stack+size):
+                off = address - sp
+                op = "+"
+                if off < 0:
+                    op = "-"
+                off = abs(off)
+                return "tid:%d sp%s%s (stack)" % (tid,op,off)
+
+        map = self.trace.getMemoryMap(address)
         if map:
             return map[3]
 
@@ -1151,12 +257,6 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
     def script(self, filename, args=[]):
         """
         Execute a vdb script.
-
-        This script has 4 references in it's builtin locals:
-        trace - The trace object
-        vdb - The vdb instance
-        vtrace - The vtrace package
-        args - User specified arguments
         """
         text = file(filename).read()
         self.scriptstring(text, filename, args)
@@ -1166,11 +266,934 @@ class Vdb(v_notif.Notifier, v_util.TraceManager):
         Do the actual compile and execute for the script data
         contained in script which was read from filename.
         """
-        local = {"vdb":self, "vtrace":vtrace,"args":args}
-        local["trace"] = self.trace
-        if self.trace.isAttached() and not self.trace.isRunning():
-            local.update(self.trace.getRegisters())
+        local = self.getExpressionLocals()
         cobj = compile(script, filename, "exec")
         sthr = ScriptThread(cobj, local)
         sthr.start()
+
+    def notify(self, event, trace):
+
+        pid = trace.getPid()
+
+        if event == vtrace.NOTIFY_ATTACH:
+            self.vprint("Attached to : %d" % pid)
+            self.difftracks = {}
+
+        elif event == vtrace.NOTIFY_CONTINUE:
+            pass
+
+        elif event == vtrace.NOTIFY_DETACH:
+            self.difftracks = {}
+            self.vprint("Detached from %d" % pid)
+
+        elif event == vtrace.NOTIFY_SIGNAL:
+            win32 = trace.getMeta("Win32Event", None)
+            if win32:
+                code = win32.get("ExceptionCode", 0)
+                addr = win32.get("ExceptionAddress")
+                chance = 2
+                if win32.get("FirstChance", False):
+                    chance = 1
+                self.vprint("Win32 Exception: 0x%.8x at 0x%.8x (%d chance)" % (code, addr, chance))
+            else:
+                self.vprint("Process Recieved Signal %d" % trace.getMeta("PendingSignal"))
+
+        elif event == vtrace.NOTIFY_BREAK:
+            tid = trace.getMeta("ThreadId")
+            bp = trace.getCurrentBreakpoint()
+            if bp:
+                self.vprint("Thread: %.8x Hit Break: %s" % (tid, repr(bp)))
+            else:
+                self.vprint("Thread: %.8x NOTIFY_BREAK" % tid)
+
+        elif event == vtrace.NOTIFY_EXIT:
+            self.vprint("PID %d exited: %d" % (pid,trace.getMeta("ExitCode")))
+
+        elif event == vtrace.NOTIFY_LOAD_LIBRARY:
+            self.vprint("Loading Binary: %s" % trace.getMeta("LatestLibrary",None))
+
+        elif event == vtrace.NOTIFY_UNLOAD_LIBRARY:
+            self.vprint("Unloading Binary: %s" % trace.getMeta("LatestLibrary",None))
+
+        elif event == vtrace.NOTIFY_CREATE_THREAD:
+            self.vprint("New Thread: %d" % trace.getMeta("ThreadId"))
+
+        elif event == vtrace.NOTIFY_EXIT_THREAD:
+            ecode = trace.getMeta("ExitCode", 0)
+            self.vprint("Exit Thread: %d (ecode: 0x%.8x (%d))" % (trace.getMeta("ThreadId"),ecode,ecode))
+
+        elif event == vtrace.NOTIFY_DEBUG_PRINT:
+            s = "<unknown>"
+            win32 = trace.getMeta("Win32Event", None)
+            if win32:
+                s = win32.get("DebugString", "<unknown>")
+            self.vprint("DEBUG PRINT: %s" % s)
+
+
+    ###################################################################
+    #
+    # All CLI extension commands start here
+    #
+
+    def do_vstruct(self, line):
+        """
+        List the available structure modules and optionally
+        structure definitions from a particular module in the
+        current vstruct.
+
+        Usage: vstruct [modname]
+        """
+        if len(line) == 0:
+            self.vprint("\nVStruct Modules:")
+            plist = vstruct.getModuleNames()
+        else:
+            self.vprint("\nKnown Structures:")
+            plist = vstruct.getStructNames(line)
+
+        for n in plist:
+            self.vprint(n)
+        self.vprint("\n")
+
+    def do_dis(self, line):
+        """
+        Print out the opcodes for a given address expression
+
+        Usage: dis <address expression> [<size expression>]
+        """
+
+        argv = e_cli.splitargs(line)
+
+        size = 20
+        argc = len(argv)
+        if argc == 0:
+            addr = self.trace.getProgramCounter()
+        else:
+            addr = self.parseExpression(argv[0])
+
+        if argc > 1:
+            size = self.parseExpression(argv[1])
+
+        import vdb.renderers as v_rend
+        rend = v_rend.OpcodeRenderer(self.trace)
+        self.vprint("Dissassembly:")
+        self.canvas.render(addr, size, rend=rend)
+
+    def do_var(self, line):
+        """
+        Set a variable in the expression parsing context.  This allows
+        for scratchspace names (python compatable names) to be used in
+        expressions.
+
+        Usage: var <name> <addr_expression>
+
+        NOTE: The address expression *must* resolve at the time you set it.
+        """
+        t = self.trace
+
+        if len(line):
+            argv = e_cli.splitargs(line)
+            if len(argv) == 1:
+                return self.do_help("var")
+            name = argv[0]
+            expr = " ".join(argv[1:])
+            addr = t.parseExpression(expr)
+            t.setVariable(name, addr)
+
+        vars = t.getVariables()
+        self.vprint("Current Variables:")
+        if not vars:
+            self.vprint("None.")
+        else:
+            vnames = vars.keys()
+            vnames.sort()
+            for n in vnames:
+                val = vars.get(n)
+                self.vprint("%20s = 0x%.8x" % (n,val))
+
+    def do_alloc(self, args):
+        #"""
+        #Allocate a chunk of memory in the target process.  You may
+        #optionally specify permissions and a suggested base address.
+
+        #Usage: alloc [-p rwx] [-s <base>] <size>
+        #"""
+        """
+        Allocate a chunk of memory in the target process.  It will be
+        allocated with rwx permissions.
+
+        Usage: alloc <size expr>
+        """
+        if len(args) == 0:
+            return self.do_help("alloc")
+        t = self.trace
+        #argv = e_cli.splitargs(args)
+        try:
+            size = t.parseExpression(args)
+            base = t.allocateMemory(size)
+            self.vprint("Allocated %d bytes at: 0x%.8x" % (size, base))
+        except Exception, e:
+            traceback.print_exc()
+            self.vprint("Allocation Error: %s" % e)
+
+    def do_struct(self, args):
+        """
+        Break out a strcuture from memory.  You may use the command
+        "vstruct" to show the known structures in vstruct.
+
+        Usage: struct <StructName> <vtrace expression>
+        """
+        try:
+            clsname, vexpr = e_cli.splitargs(args)
+        except:
+            return self.do_help("struct")
+
+        t = self.trace
+
+        addr = t.parseExpression(vexpr)
+        s = t.getStruct(clsname, addr)
+        self.vprint(s.tree(va=addr))
+
+    def do_signal(self, args):
+        """
+        Show or set the current pending signal (this is ONLY relavent on POSIX signaling
+        systems).
+
+        Usage: signal [newsigno]
+        """
+        t = self.trace
+        t.requireAttached()
+        cursig = t.getMeta("PendingSignal", 0)
+        self.vprint("Current signal: %d" % cursig)
+        if args:
+            newsig = int(args)
+            t.setMeta("PendingSignal", newsig)
+            self.vprint("New signal: %d" % newsig)
+
+    @firethread
+    def do_snapshot(self, line):
+        """
+        Take a process snapshot of the current (stopped) trace and
+        save it to the specified file.
+
+        Usage: snapshot <filename>
+        """
+        if len(line) == 0:
+            return self.do_help("snapshot")
+        alist = e_cli.splitargs(line)
+        if len(alist) != 1:
+            return self.do_help("snapshot")
+
+        t = self.trace
+        t.requireAttached()
+        self.vprint("Taking Snapshot...")
+        snap = t.takeSnapshot()
+        self.vprint("Saving To File")
+        snap.saveToFile(alist[0])
+        self.vprint("Done")
+
+    def do_ignore(self, args):
+        """
+        Add the specified signal id (exception id for windows) to the ignored
+        signals list for the current trace.  This will make the smallest possible
+        performance impact for that particular signal but will also not alert
+        you that it has occured.
+
+        Usage: ignore [[-d] <sigcode>]
+        """
+        alist = e_cli.splitargs(args)
+        if len(alist) == 1:
+            sigid = int(args, 0)
+            self.vprint("ADDING 0x%.8x to the ignores list" % sigid)
+            self.trace.addIgnoreSignal(sigid)
+        elif len(alist) == 2 and alist[0] == "-d":
+            sigid = int(alist[1], 0)
+            self.trace.delIgnoreSignal(sigid)
+        else:
+            ilist = self.trace.getMeta("IgnoredSignals")
+            self.vprint("Currently Ignored Signals/Exceptions:")
+            for x in ilist:
+                self.vprint("0x%.8x" % x)
+
+    def do_exec(self, string):
+        """
+        Execute a program with the given command line and
+        attach to it.
+        Usage: exec </some/where and some args>
+        """
+        t = self.newTrace()
+        t.execute(string)
+
+    def do_threads(self, line):
+        """
+        List the current threads in the target process or select
+        the current thread context for the target tracer.
+        Usage: threads [thread id]
+        """
+        self.trace.requireNotRunning()
+        if self.trace.isRunning():
+            self.vprint("Can't list threads while running!")
+            return
+
+        if len(line) > 0:
+            thrid = int(line, 0)
+            self.trace.selectThread(thrid)
+
+        self.vprint("Current Threads:")
+        self.vprint("[thrid] [thrinfo]  [pc]")
+
+        curtid = self.trace.getMeta("ThreadId")
+        for tid,tinfo in self.trace.getThreads().items():
+            a = " "
+            if tid == curtid:
+                a = "*"
+
+            sus = ""
+            if self.trace.isThreadSuspended(tid):
+                sus = "(suspended)"
+            ctx = self.trace.getRegisterContext(tid)
+            pc = ctx.getProgramCounter()
+            self.vprint("%s%6d 0x%.8x 0x%.8x %s" % (a, tid, tinfo, pc, sus))
+
+    def do_suspend(self, line):
+        """
+        Suspend a thread.
+
+        Usage: suspend <-A | <tid>[ <tid>...]>
+        """
+        argv = e_cli.splitargs(line)
+        try:
+            opts,args = getopt(argv, "A")
+        except Exception, e:
+            return self.do_help("suspend")
+
+        for opt,optarg in opts:
+            if opt == "-A":
+                # hehe...
+                args = [str(tid) for tid in self.trace.getThreads().keys()]
+
+        if not len(args):
+            return self.do_help("suspend")
+
+        for arg in args:
+            tid = int(arg)
+            self.trace.suspendThread(tid)
+            self.vprint("Suspended Thread: %d" % tid)
+
+    def do_resume(self, line):
+        """
+        Resume a thread.
+
+        Usage: resume <-A | <tid>[ <tid>...]>
+        """
+        argv = e_cli.splitargs(line)
+        try:
+            opts,args = getopt(argv, "A")
+        except Exception, e:
+            return self.do_help("suspend")
+
+        for opt,optarg in opts:
+            if opt == "-A":
+                # hehe...
+                args = [str(tid) for tid in self.trace.getThreads().keys()]
+
+        if not len(args):
+            return self.do_help("resume")
+
+        for arg in args:
+            tid = int(arg)
+            self.trace.resumeThread(tid)
+            self.vprint("Resumed Thread: %d" % tid)
+
+    #def do_inject(self, line):
+
+    def do_mode(self, args):
+        """
+        Set modes in the tracers...
+        mode Foo=True/False
+        """
+        if args:
+            mode,val = args.split("=")
+            newmode = eval(val)
+            self.setMode(mode, newmode)
+        else:
+            for key,val in self.trace.modes.items():
+                self.vprint("%s -> %d" % (key,val))
+
+    def do_reg(self, args):
+        """
+        Show the current register values.  Additionally, you may specify
+        name=<expression> to set a register
+
+        Usage: reg [regname=vtrace_expression]
+        """
+        if len(args):
+            if args.find("=") == -1:
+                return self.do_help("reg")
+            regname,expr = args.split("=", 1)
+            val = self.trace.parseExpression(expr)
+            self.trace.setRegisterByName(regname, val)
+            self.vprint("%s = 0x%.8x" % (regname, val))
+            return
+
+        regs = self.trace.getRegisters()
+        rnames = regs.keys()
+        rnames.sort()
+        final = []
+        for r in rnames:
+            # Capitol names are used for reg vals that we don't want to see
+            # (by default)
+            if r.lower() != r:
+                continue
+            val = regs.get(r)
+            vstr = e_bits.hex(val, 4)
+            final.append(("%12s:0x%.8x (%d)" % (r,val,val)))
+        self.columnize(final)
+
+    def do_stepi(self, args):
+        """
+        Single step the target tracer.
+        Usage: stepi [count expression]
+        """
+        if len(args):
+            count = self.trace.parseExpression(args)
+        else:
+            count = 1
+
+        for i in xrange(count):
+            self.trace.stepi()
+
+    def do_go(self, line):
+        """
+        Continue the target tracer.
+        -I go icount linear instructions forward (step over style)
+        -U go *out* of fcount frames (step out style)
+        <until addr> go until explicit address
+
+        Usage: go [-U <fcount> | -I <icount> | <until addr expression>]
+        """
+        until = None
+        icount = None
+        fcount = None
+
+        argv = e_cli.splitargs(line)
+        try:
+            opts,args = getopt(argv, "U:I:")
+        except:
+            return self.do_help("go")
+
+        for opt,optarg in opts:
+            if opt == "-U":
+                if len(optarg) == 0: return self.do_help("go")
+                fcount = self.trace.parseExpression(optarg)
+            elif opt == "-I":
+                if len(optarg) == 0: return self.do_help("go")
+                icount = self.trace.parseExpression(optarg)
+
+        if icount != None:
+            addr = self.trace.getProgramCounter()
+            for i in xrange(icount):
+                addr += len(self.arch.makeOpcode(self.trace.readMemory(addr, 16)))
+            until = addr
+
+        elif fcount != None:
+            until = self.trace.getStackTrace()[fcount][0]
+
+        elif len(args):
+            until = self.trace.parseExpression(" ".join(args))
+
+        if not until:
+            self.vprint("Running Tracer (use 'break' to stop it)")
+
+        self.trace.run(until=until)
+
+    def do_server(self, port):
+        """
+        Start a vtrace server on the local box
+        optionally specify the port
+
+        Usage: server [port]
+        """
+        if port:
+            vtrace.port = int(port)
+
+        vtrace.startVtraceServer()
+
+    def do_syms(self, line):
+        """
+        List symbols and by file.
+
+        Usage: syms [-s <pattern>] [filename]
+
+        With no arguments, syms will self.vprint(the possible
+        libraries with symbol resolvers.  Specify a library
+        to see all the symbols for it.
+        """
+
+        argv = e_cli.splitargs(line)
+        try:
+            opts,args = getopt(argv, "s:")
+        except:
+            return self.do_help("syms")
+
+        pattern = None
+        for opt,optarg in opts:
+            if opt == "-s":
+                pattern = optarg.lower()
+
+        libs = self.trace.getNormalizedLibNames()
+        if len(args) == 0:
+            self.vprint("Current Library Symbol Resolvers:")
+            libs.sort()
+            for libname in libs:
+                self.vprint("  %s" % libname)
+
+        else:
+            libname = args[0]
+            if libname not in libs:
+                self.vprint("Unknown libname: %s" % libname)
+                return
+            if pattern:
+                self.vprint("Matching Symbols From %s:" % libname)
+            else:
+                self.vprint("Symbols From %s:" % libname)
+
+            for sym in self.trace.getSymsForFile(libname):
+                r = repr(sym)
+                if pattern != None:
+                    if r.lower().find(pattern) == -1:
+                        continue
+                self.vprint("0x%.8x %s" % (sym.value, r))
+
+    @firethread
+    def do_call(self, string):
+        """
+        Allows a C-like syntax for calling functions inside
+        the target process (from his context).
+        Example: call printf("yermom %d", 10)
+        """
+        self.trace.requireAttached()
+        ind = string.index("(")
+        if ind == -1:
+            raise Exception('ERROR - call wants c-style syntax: ie call printf("yermom")')
+        funcaddr = self.trace.parseExpression(string[:ind])
+
+        try:
+            args = eval(string[ind:])
+        except:
+            raise Exception('ERROR - call wants c-style syntax: ie call printf("yermom")')
+
+        self.vprint("calling %s -> 0x%.8x" % (string[:ind], funcaddr))
+        self.trace.call(funcaddr, args)
+
+    def do_bestname(self, args):
+        """
+        Return the "best name" string for an address.
+
+        Usage: bestname <vtrace expression>
+        """
+        if len(args) == 0:
+            return self.do_help("bestname")
+        addr = self.trace.parseExpression(args)
+        self.vprint(self.reprPointer(addr))
+
+    def do_EOF(self, string):
+        self.vprint("No.. this is NOT a python interpreter... use quit ;)")
+
+    def do_quit(self,args):
+        """
+        Quit VDB
+        """
+        if self.trace.isRunning():
+            self.trace.setMode("RunForever", False)
+            self.trace.sendBreak()
+
+        if self.trace.isAttached():
+            self.vprint("Detaching...")
+            self.trace.detach()
+
+        self.vprint("Exiting...")
+        e_cli.EnviMutableCli.do_quit(self, args)
+
+    def do_detach(self, args):
+        """
+        Detach from the current tracer
+        """
+        self.trace.requireAttached()
+        if self.trace.isRunning():
+            self.trace.setMode("RunForever", False)
+            self.trace.sendBreak()
+        self.trace.detach()
+
+    def do_attach(self, args):
+        """
+        Attach to a process by PID
+        Usage: attach <pid>
+        """
+        pid = int(args)
+        self.vprint("Attaching to ",pid)
+        self.newTrace().attach(pid)
+
+    def do_autocont(self, line):
+        """
+        Manipulate the auto-continue behavior for the trace.  This
+        will cause particular event types to automagically continue
+        execution.
+
+        Usage: autocont [event name]
+        """
+        argv = e_cli.splitargs(line)
+        acnames = ["attach",
+                   "signal",
+                   "break",
+                   "loadlib",
+                   "unloadlib",
+                   "createthread",
+                   "exitthread",
+                   "dbgprint"]
+
+        acvals = [ vtrace.NOTIFY_ATTACH,
+                   vtrace.NOTIFY_SIGNAL, 
+                   vtrace.NOTIFY_BREAK,
+                   vtrace.NOTIFY_LOAD_LIBRARY,
+                   vtrace.NOTIFY_UNLOAD_LIBRARY,
+                   vtrace.NOTIFY_CREATE_THREAD,
+                   vtrace.NOTIFY_EXIT_THREAD,
+                   vtrace.NOTIFY_DEBUG_PRINT]
+
+        c = self.trace.getAutoContinueList()
+
+        if len(line):
+            try:
+                index = acnames.index(line)
+            except ValueError, e:
+                self.vprint("Unknown event name: %s" % line)
+                return
+            sig = acvals[index]
+            if sig in c:
+                self.trace.disableAutoContinue(sig)
+                c.remove(sig)
+            else:
+                self.trace.enableAutoContinue(sig)
+                c.append(sig)
+
+        self.vprint("Auto Continue Status:")
+        for i in range(len(acnames)):
+            name = acnames[i]
+            sig = acvals[i]
+            acont = False
+            if sig in c:
+                acont = True
+            self.vprint("%s %s" % (name.rjust(14),repr(acont)))
+
+    def emptyline(self):
+        self.do_help("")
+
+    def do_bt(self, line):
+        """
+        Show a stack backtrace for the currently selected thread.
+
+        Usage: bt
+        """
+        self.vprint("[   PC   ] [ Frame  ] [ Location ]")
+        for frame in self.trace.getStackTrace():
+            self.vprint("0x%.8x 0x%.8x %s" % (frame[0],frame[1],self.reprPointer(frame[0])))
+
+    def do_lm(self, args):
+        """
+        Show the loaded libraries and their base addresses.
+
+        Usage: lm [libname]
+        """
+        bases = self.trace.getMeta("LibraryBases")
+        paths = self.trace.getMeta("LibraryPaths")
+        if len(args):
+            base = bases.get(args)
+            path = paths.get(base, "unknown")
+            if base == None:
+                self.vprint("Library %s is not found!" % args)
+            else:
+                self.vprint("0x%.8x - %s %s" % (base, args, path))
+        else:
+            self.vprint("Loaded Libraries:")
+            names = self.trace.getNormalizedLibNames()
+            names.sort()
+            names = self.columnstr(names)
+            for libname in names:
+                base = bases.get(libname.strip(), -1)
+                path = paths.get(base, "unknown")
+                self.vprint("0x%.8x - %.30s %s" % (base, libname, path))
+
+    def columnstr(self, slist):
+        msize = 0
+        for s in slist:
+            if len(s) > msize:
+                msize = len(s)
+        return [x.ljust(msize) for x in slist]
+
+    def do_guid(self, line):
+        """
+        Parse and display a Global Unique Identifier (GUID) from memory
+        (eventually, use GUID db to lookup the name/meaning of the GUID).
+
+        Usage: guid <addr_exp>
+        """
+        self.trace.requireNotRunning()
+        if not line:
+            return self.do_help("guid")
+
+        addr = self.parseExpression(line)
+        guid = vs_prims.GUID()
+        bytes = self.trace.readMemory(addr, len(guid))
+        guid.vsSetValue(bytes)
+        self.vprint("GUID 0x%.8x %s" % (addr, repr(guid)))
+
+    def do_bpfile(self, line):
+        """
+        Set the python code for a breakpoint from the contents
+        of a file.
+
+        Usage: bpfile <bpid> <filename>
+        """
+        argv = e_cli.splitargs(line)
+        if len(argv) != 2:
+            return self.do_help("bpfile")
+
+        bpid = int(argv[0])
+        pycode = file(argv[1], "rU").read()
+
+        self.trace.setBreakpointCode(bpid, pycode)
+
+    def do_bpedit(self, line):
+        """
+        Manipulcate the python code that will be run for a given
+        breakpoint by ID.  (Also the way to view the code).
+
+        Usage: bpedit <id> ["optionally new code"]
+
+        NOTE: Your code must be surrounded by "s and may not
+        contain any "s
+        """
+        argv = e_cli.splitargs(line)
+        if len(argv) == 0:
+            return self.do_help("bpedit")
+        bpid = int(argv[0])
+
+        if len(argv) == 2:
+            self.trace.setBreakpointCode(bpid, argv[1])
+
+        pystr = self.trace.getBreakpointCode(bpid)
+        self.vprint("[%d] Breakpoint code: %s" % (bpid,pystr))
+
+    def do_bp(self, line):
+        """
+        Show, add,  and enable/disable breakpoints
+        USAGE: bp [-d <addr>] [-a <addr>] [-o <addr>] [[-c pycode] <address> ...]
+        -C - Clear All Breakpoints
+        -c "py code" - Set the breakpoint code to the given python string
+        -d <id> - Disable Breakpoint
+        -e <id> - Enable Breakpoint
+        -r <id> - Remove Breakpoint
+        -o <addr> - Create a OneTimeBreak
+        -L <libname> - Add bp's to all functions in <libname>
+        -F <filename> - Load bpcode from file
+        -W perms:size - Set a hardware Watchpoint with perms/size (ie -W rw:4)
+        <address>... - Create Breakpoint
+
+        NOTE: -c adds python code to the breakpoint.  The python code will
+            be run with the following objects mapped into it's namespace
+            automagically:
+                vtrace  - the vtrace package
+                trace   - the tracer
+                bp      - the breakpoint object
+        """
+        self.trace.requireNotRunning()
+
+        argv = e_cli.splitargs(line)
+        opts,args = getopt(argv, "F:e:d:o:r:L:Cc:W:")
+        pycode = None
+        wpargs = None
+
+        for opt,optarg in opts:
+            if opt == "-e":
+                self.trace.setBreakpointEnabled(eval(optarg), True)
+
+            elif opt == "-c":
+                pycode = optarg
+                test = compile(pycode, "test","exec")
+
+            elif opt == "-F":
+                pycode = file(optarg, "rU").read()
+
+            elif opt == "-r":
+                self.trace.removeBreakpoint(eval(optarg))
+
+            elif opt == "-C":
+                for bp in self.trace.getBreakpoints():
+                    self.trace.removeBreakpoint(bp.id)
+
+            elif opt == "-d":
+                self.trace.setBreakpointEnabled(eval(optarg), False)
+
+            elif opt == "-o":
+                self.trace.addBreakpoint(vtrace.OneTimeBreak(None, expression=optarg))
+
+            elif opt == "-L":
+                for sym in self.trace.getSymsForFile(optarg):
+                    if not isinstance(sym, e_resolv.FunctionSymbol):
+                        continue
+                    try:
+                        bp = vtrace.Breakpoint(None, expression=str(sym))
+                        bp.setBreakpointCode(pycode)
+                        self.trace.addBreakpoint(bp)
+                        self.vprint("Added: %s" % str(sym))
+                    except Exception, msg:
+                        self.vprint("WARNING: %s" % str(msg))
+
+            elif opt == "-W":
+                wpargs = optarg.split(":")
+
+        for arg in args:
+            if wpargs != None:
+                size = int(wpargs[1])
+                bp = vtrace.Watchpoint(None, expression=arg, size=size, perms=wpargs[0])
+            else:
+                bp = vtrace.Breakpoint(None, expression=arg)
+            bp.setBreakpointCode(pycode)
+            self.trace.addBreakpoint(bp)
+
+        self.vprint(" [ Breakpoints ]")
+        for bp in self.trace.getBreakpoints():
+            self.vprint("%s enabled: %s" % (bp, bp.isEnabled()))
+
+    def do_fds(self, args):
+        """
+        Show all the open Handles/FileDescriptors for the target process.
+        The "typecode" shown in []'s is the vtrace typecode for that kind of
+        fd/handle.
+
+        Usage: fds
+        """
+        self.trace.requireAttached()
+        for id,fdtype,fname in self.trace.getFds():
+            self.vprint("0x%.8x [%d] %s" % (id,fdtype,fname))
+
+    def do_ps(self, args):
+        """
+        Show the current process list.
+
+        Usage: ps
+        """
+        self.vprint("[Pid]\t[ Name ]")
+        for ps in self.trace.ps():
+            self.vprint("%s\t%s" % (ps[0],ps[1]))
+
+    def do_break(self, args):
+        """
+        Send the break signal to the target tracer to stop
+        it's execution.
+
+        Usage: break
+        """
+        self.trace.setMode("RunForever", False)
+        self.trace.sendBreak()
+
+    def do_meta(self, string):
+        """
+        Show the metadata for the current trace.
+
+        Usage: meta
+        """
+        meta = self.trace.metadata
+        x = pprint.pformat(meta)
+        self.vprint(x)
+
+    def do_memdiff(self, line):
+        """
+        Save and compare snapshots of memory to enumerate changes.
+
+        Usage: memdiff [options]
+        -C             Clear all current memory diff snapshots.
+        -A <va:size>   Add the given virtual address to the list.
+        -M <va>        Add the entire memory map which contains VA to the list.
+        -D             Compare currently tracked memory with the target process
+                       and show any differences.
+        """
+        argv = e_cli.splitargs(line)
+        opts,args = getopt(argv, "A:CDM:")
+
+        if len(opts) == 0:
+            return self.do_help('memdiff')
+
+        self.trace.requireNotRunning()
+
+        for opt,optarg in opts:
+
+            if opt == "-A":
+                if optarg.find(':') == -1:
+                    return self.do_help('memdiff')
+
+                vastr,sizestr = optarg.split(':')
+                va = self.parseExpression(vastr)
+                size = self.parseExpression(sizestr)
+                bytes = self.trace.readMemory(va,size)
+                self.difftracks[va] = bytes
+
+            elif opt == '-C':
+                self.difftracks = {}
+
+            elif opt == '-D':
+                difs = self._getDiffs()
+                if len(difs) == 0:
+                    self.vprint('No Differences!')
+                else:
+                    for va,thenbytes,nowbytes in difs:
+                        self.vprint('0x%.8x: %s %s' %
+                                    (va,
+                                     thenbytes.encode('hex'),
+                                     nowbytes.encode('hex')))
+
+            elif opt == '-M':
+                va = self.parseExpression(optarg)
+                map = self.trace.getMemoryMap(va)
+                if map == None:
+                    self.vprint('No Memory Map At: 0x%.8x' % va)
+                    return
+                mva,msize,mperm,mfile = map
+                bytes = self.trace.readMemory(mva, msize)
+                self.difftracks[mva] = bytes
+
+    def _getDiffs(self):
+
+        ret = []
+        for va, bytes in self.difftracks.items():
+            nowbytes = self.trace.readMemory(va, len(bytes))
+
+            i = 0
+            while i < len(bytes):
+                thendiff = ""
+                nowdiff = ""
+                iva = va+i
+                while (i < len(bytes) and
+                            bytes[i] != nowbytes[i]):
+                    thendiff += bytes[i]
+                    nowdiff += nowbytes[i]
+                    i += 1
+
+                if thendiff:
+                    ret.append((iva, thendiff, nowdiff))
+                    continue
+
+                i += 1
+        
+        return ret
+
+    def FIXME_do_remote(self, line):
+        """
+        Act as a remote debugging client to the server running on
+        the specified host/ip.
+
+        Usage: remote <host>
+        """
+        vtrace.remote = line
+        # FIXME how do we re-init the debugger?
 
