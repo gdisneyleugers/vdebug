@@ -1,12 +1,15 @@
 
 import os
 import vwidget
+import vwidget.windows as vw_windows
+import vwidget.util as vw_util
 import vtrace.tools.win32heap as win32heap
 
 import vdb
 import vdb.gui
 
-import vwidget
+import envi.memcanvas as e_canvas
+import vwidget.memview as vw_memview
 
 import gtk
 import pango
@@ -14,9 +17,113 @@ import pango
 busy_color = (0xff, 0, 0)
 def_color  = (0, 0xff, 0)
 
-class Win32HeapWindow(vdb.gui.VdbWindow):
+class VdbHeapRenderer(e_canvas.MemoryRenderer):
+    """
+    A renderer which knows how to show heap chunks
+    (only to be used on aligned addresses, our parent window
+    takes care of that)
+    """
+    def __init__(self, trace):
+        self.trace = trace
+
+    def getPad(self, buf, size):
+        return " " * (size-len(buf))
+
+    def isAscii(self, buf):
+        for b in buf:
+            v = ord(b)
+            if v == 0:
+                continue
+            if v < 0x20 or v >= 0x7f:
+                return False
+        return True
+
+    def render(self, canvas, va):
+        chunk = win32heap.Win32Chunk(self.trace, va)
+        size = len(chunk)
+        canvas.addVaText("0x%.8x" % va, va=va)
+        canvas.addText(": ")
+        sizestr = str(len(chunk))
+        sizepad = self.getPad(sizestr, 7)
+        canvas.addText("CHUNK:%s" % sizepad)
+        canvas.addNameText(sizestr, name="chunk:%d" % size)
+        canvas.addText(" %s" % chunk.reprFlags())
+        canvas.addText("\n")
+
+        dva = chunk.getDataAddress()
+        dsize = chunk.getDataSize()
+        #r = min(32, dsize)
+        canvas.addVaText("0x%.8x" % dva, va=dva)
+        dsizestr = str(dsize)
+        dsizepad = self.getPad(dsizestr, 7)
+        canvas.addText(": %s" % dsizepad)
+        canvas.addNameText(dsizestr, name="data:%d" % dsize)
+        canvas.addText(": ")
+
+        bytes = self.trace.readMemory(dva, dsize)
+
+        if not chunk.isBusy():
+            flink, blink = self.trace.readMemoryFormat(dva, "PP")
+            canvas.addText("FLINK: ")
+            canvas.addVaText("0x%.8x" % flink, va=flink)
+            canvas.addText(" BLINK: ")
+            canvas.addVaText("0x%.8x" % blink, va=blink)
+            canvas.addText(" leftovers: %s" % bytes[8:8+32].encode('hex'))
+
+        else:
+            if self.isAscii(bytes):
+                canvas.addText(bytes[:128].replace("\x00",""))
+            else:
+                canvas.addText("%s" % bytes[:32].encode('hex'))
+
+        canvas.addText("\n")
+
+        return size
+
+class VdbHeapView(vw_memview.MemoryView):
+
+    def render(self, va, size, rend=None):
+        trace = self.mem
+        heap, seg, chunk = win32heap.getHeapSegChunk(trace, va)
+        va = seg.address
+
+        # FIXME if is valid
+        last = seg.getLastChunk()
+        size = (last.address+len(last))-va
+
+        vw_memview.MemoryView.render(self, va, size, rend=rend)
+
+
+class VdbHeapWindow(vw_memview.MemoryWindow):
+    def __init__(self, db, gui):
+        self.db = db
+        self.gui = gui
+        self.trace = vdb.VdbTrace(db)
+
+        canvas = VdbHeapView(self.trace, syms=self.trace)
+        canvas.addRenderer("Windows Heap", VdbHeapRenderer(self.trace))
+        vw_memview.MemoryWindow.__init__(self, canvas)
+
+    # These are straight stolen from vdb gui
+    def setTraceWindowActive(self, active=True):
+        if active:
+            self.vbox.set_sensitive(True)
+            self.updateMemoryView()
+        else:
+            self.vbox.set_sensitive(False)
+
+    def updateMemoryView(self, *args):
+
+        trace = self.db.getTrace()
+        if (not trace.isAttached()) or trace.isRunning():
+            return
+
+        return vw_memview.MemoryWindow.updateMemoryView(self, *args)
+
+class Win32HeapWindow(vw_windows.VWindow):
     def __init__(self, db):
-        vdb.gui.VdbWindow.__init__(self, db, os.path.join(vdb.basepath,"glade","Win32Heap.glade"))
+        vw_windows.VWindow.__init__(self, os.path.join(vdb.basepath,"glade","Win32Heap.glade"), None)
+        self.vdb = db
         self.font = pango.FontDescription("Monospace 10")
         self.setupHeapTree()
         self.setupChunkList()
@@ -50,10 +157,10 @@ class Win32HeapWindow(vdb.gui.VdbWindow):
     def setupChunkList(self):
         tree = self.getWidget("Win32ChunkList")
         tree.modify_font(self.font)
-        col1 = self.getTreeviewTextColumn("Chunkaddr", 1)
-        col2 = self.getTreeviewTextColumn("Size", 2)
-        col3 = self.getTreeviewTextColumn("Busy", 3) # FIXME make a picture?
-        col4 = self.getTreeviewTextColumn("Bytes", 4)
+        col1 = vw_util.makeColumn("Chunkaddr", 1)
+        col2 = vw_util.makeColumn("Size", 2)
+        col3 = vw_util.makeColumn("Busy", 3) # FIXME make a picture?
+        col4 = vw_util.makeColumn("Bytes", 4)
         tree.append_column(col1)
         tree.append_column(col2)
         tree.append_column(col3)
@@ -97,8 +204,8 @@ class Win32HeapWindow(vdb.gui.VdbWindow):
     def setupHeapTree(self):
         tree = self.getWidget("Win32HeapTree")
         tree.modify_font(self.font)
-        col1 = self.getTreeviewTextColumn("Heap", 1)
-        col2 = self.getTreeviewTextColumn("Segment", 2)
+        col1 = vw_util.makeColumn("Heap", 1)
+        col2 = vw_util.makeColumn("Segment", 2)
         tree.append_column(col1)
         tree.append_column(col2)
         store =  gtk.TreeStore(object,str,str)
@@ -121,14 +228,15 @@ class Win32HeapWindow(vdb.gui.VdbWindow):
                 i = model.append(None, (s, "0x%.8x" % h.address,"0x%.8x" % s.address))
                 model.append(i, (None, repr(h.heap), repr(s.seg)))
 
-def heapview(vdb, line):
+def heapview(db, line):
     """
     Open a Win32 Heap View window.
 
     Usage: heapview
     """
-    Win32HeapWindow(vdb)
+    Win32HeapWindow(db)
 
-def vdbGuiExtension(vdb, mainwin):
-    vdb.registerCmdExtension(heapview)
+def vdbGuiExtension(db, gui):
+    db.registerCmdExtension(heapview)
+    gui.addExtensionWindow("Windows Heap", VdbHeapWindow)
 

@@ -436,7 +436,7 @@ class CobraDaemon(ThreadingTCPServer):
             self.reflock.release()
 
     def unshareObject(self, name):
-        self.refcnts.pop(name)
+        self.refcnts.pop(name, None)
         return self.shared.pop(name, None)
 
 class CobraSslDaemon(CobraDaemon):

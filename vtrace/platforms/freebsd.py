@@ -6,7 +6,13 @@ import os
 import ctypes
 import ctypes.util as cutil
 
+import envi.memory as e_mem
+import envi.cli as e_cli
+
 import vtrace
+import vtrace.archs.i386 as v_i386
+import vtrace.archs.amd64 as v_amd64
+import vtrace.platforms.base as v_base
 import vtrace.platforms.posix as v_posix
 import vtrace.util as v_util
 
@@ -36,9 +42,9 @@ sigset_t = ctypes.c_uint32*4
 uid_t = ctypes.c_uint32
 gid_t = ctypes.c_uint32
 fixpt_t = ctypes.c_uint32
-
-vm_size_t = ctypes.c_uint32 # FIXME this should maybe be 64 bit safe
-segsz_t = ctypes.c_uint32 # FIXME this should maybe be 64 bit safe
+caddr_t = ctypes.c_void_p
+vm_size_t = ctypes.c_ulong
+segsz_t = ctypes.c_ulong
 
 # Could go crazy and grep headers for this stuff ;)
 KI_NGROUPS = 16
@@ -100,10 +106,10 @@ class KINFO_PROC(ctypes.Structure):
         ("ki_addr", void_p),            # kernel virtual addr of u-area (struct user*)
         ("ki_tracep", void_p),          # pointer to trace file (struct vnode *)
         ("ki_textvp", void_p),          # pointer to executable file (struct vnode *)
-	("ki_fd", void_p),              # pointer to open file info (struct filedesc  *)
+        ("ki_fd", void_p),              # pointer to open file info (struct filedesc  *)
         ("ki_vmspace", void_p),         # pointer to kernel vmspace struct (struct vmspace *)
         ("ki_wchan", void_p),           # sleep address (void*)
-	("ki_pid", pid_t),              # Process identifier
+        ("ki_pid", pid_t),              # Process identifier
         ("ki_ppid", pid_t),             # parent process id
         ("ki_pgid", pid_t),             # process group id
         ("ki_tpgid", pid_t),            # tty process group id
@@ -173,6 +179,12 @@ class KINFO_PROC(ctypes.Structure):
         ("ki_tdflags", ctypes.c_long),  # KSE kthread flag
     )
 
+libkvm.kvm_getprocs.argtypes = [caddr_t, ctypes.c_int, ctypes.c_int, caddr_t]
+libkvm.kvm_getprocs.restype = ctypes.POINTER(KINFO_PROC)
+
+libkvm.kvm_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+libkvm.kvm_open.restype = caddr_t
+
 # All the FreeBSD ptrace defines
 PT_TRACE_ME     = 0       #/* child declares it's being traced */
 PT_READ_I       = 1       #/* read word in child's I space */
@@ -236,7 +248,7 @@ PL_FLAGS_BOUND = 1
 
 class FreeBSDMixin:
 
-    def initMixin(self):
+    def __init__(self):
         self.initMode("Syscall", False, "Break on Syscalls")
         self.kvmh = libkvm.kvm_open(None, None, None, 0, "vtrace")
 
@@ -281,7 +293,7 @@ class FreeBSDMixin:
     def platformExec(self, cmdline):
         # Basically just like the one in the Ptrace mixin...
         self.execing = True
-        cmdlist = v_util.splitargs(cmdline)
+        cmdlist = e_cli.splitargs(cmdline)
         os.stat(cmdlist[0])
         pid = os.fork()
         if pid == 0:
@@ -296,7 +308,7 @@ class FreeBSDMixin:
 
         info = PTRACE_LWPINFO()
         size = ctypes.sizeof(info)
-        if v_posix.ptrace(PT_LWPINFO, self.pid, ctypes.byref(info), size) == 0:
+        if v_posix.ptrace(PT_LWPINFO, self.pid, ctypes.addressof(info), size) == 0:
             self.setMeta("ThreadId", info.pl_lwpid)
         else:
             #FIXME this is because posix wait is linux specific and broke
@@ -330,11 +342,19 @@ class FreeBSDMixin:
         ret = {}
         cnt = self._getThreadCount()
         buf = (ctypes.c_int * cnt)()
-        if v_posix.ptrace(PT_GETLWPLIST, self.pid, buf, cnt) != cnt:
+        if v_posix.ptrace(PT_GETLWPLIST, self.pid, ctypes.addressof(buf), cnt) != cnt:
             raise Exception("ptrace PW_GETLWPLIST failed")
         for x in buf:
             ret[x] = x
         return ret
+
+    def platformSuspendThread(self, tid):
+        if v_posix.ptrace(PT_SUSPEND, tid, 0, 0) != 0:
+            raise Exception("ptrace PT_SUSPEND failed!")
+
+    def platformResumeThread(self, tid):
+        if v_posix.ptrace(PT_RESUME, tid, 0, 0) != 0:
+            raise Exception("ptrace PT_RESUME failed!")
 
     def _getThreadCount(self):
         return v_posix.ptrace(PT_GETNUMLWPS, self.pid, 0, 0)
@@ -347,7 +367,7 @@ class FreeBSDMixin:
         ret = []
         mpath = "/proc/%d/map" % self.pid
         if not os.path.isfile(mpath):
-            raise Exception("Memory map enumeration requires /proc on FreeBSD")
+            raise Exception("Memory maps need /proc! (use: mount -t procfs procfs /proc)")
 
         mapfile = file(mpath, "rb")
         for line in mapfile:
@@ -362,13 +382,13 @@ class FreeBSDMixin:
                 fname = maptup[12].strip()
 
             if permstr[0] == 'r':
-                perms |= vtrace.MM_READ
+                perms |= e_mem.MM_READ
 
             if permstr[1] == 'w':
-                perms |= vtrace.MM_WRITE
+                perms |= e_mem.MM_WRITE
 
             if permstr[2] == 'x':
-                perms |= vtrace.MM_EXEC
+                perms |= e_mem.MM_EXEC
 
             ret.append((base, max-base, perms, fname))
 
@@ -377,50 +397,170 @@ class FreeBSDMixin:
     def platformPs(self):
         ret = []
         cnt = ctypes.c_uint(0)
-        kinfo = KINFO_PROC()
-        ksize = ctypes.sizeof(kinfo)
-        kaddr = ctypes.addressof(kinfo)
 
         p = libkvm.kvm_getprocs(self.kvmh, KERN_PROC_PROC, 0, ctypes.addressof(cnt))
         for i in xrange(cnt.value):
-            ctypes.memmove(kaddr, p + (i*ksize), ksize)
-            if kinfo.ki_structsize != ksize:
+            kinfo = p[i]
+            if kinfo.ki_structsize != ctypes.sizeof(KINFO_PROC):
                 print "WARNING: KINFO_PROC CHANGED SIZE, Trying to account for it... good luck"
-                ksize = kinfo.ki_structsize
             ret.append((kinfo.ki_pid, kinfo.ki_comm))
 
         return ret
 
-GEN_REG_CNT = 19
-DBG_REG_CNT = 8
-TOT_REG_CNT = GEN_REG_CNT + DBG_REG_CNT
+class bsd_regs_i386(ctypes.Structure):
+    _fields_ = (
+        ("fs",  ctypes.c_ulong),
+        ("es",  ctypes.c_ulong),
+        ("ds",  ctypes.c_ulong),
+        ("edi",  ctypes.c_ulong),
+        ("esi",  ctypes.c_ulong),
+        ("ebp",  ctypes.c_ulong),
+        ("isp",  ctypes.c_ulong),
+        ("ebx",  ctypes.c_ulong),
+        ("edx",  ctypes.c_ulong),
+        ("ecx",  ctypes.c_ulong),
+        ("eax",  ctypes.c_ulong),
+        ("trapno",  ctypes.c_ulong),
+        ("err",  ctypes.c_ulong),
+        ("eip",  ctypes.c_ulong),
+        ("cs",  ctypes.c_ulong),
+        ("eflags",  ctypes.c_ulong),
+        ("esp",  ctypes.c_ulong),
+        ("ss",  ctypes.c_ulong),
+        ("gs",  ctypes.c_ulong),
+        ("debug0",  ctypes.c_ulong),
+        ("debug1",  ctypes.c_ulong),
+        ("debug2",  ctypes.c_ulong),
+        ("debug3",  ctypes.c_ulong),
+        ("debug4",  ctypes.c_ulong),
+        ("debug5",  ctypes.c_ulong),
+        ("debug6",  ctypes.c_ulong),
+        ("debug7",  ctypes.c_ulong),
+    )
 
-class FreeBSDIntelRegisters:
+i386_DBG_OFF = (19*4)
 
-    def platformGetRegs(self):
-        buf = ctypes.create_string_buffer(TOT_REG_CNT*4)
-        #FIXME thread specific
-        if v_posix.ptrace(PT_GETREGS, self.pid, buf, 0) != 0:
+class bsd_regs_amd64(ctypes.Structure):
+    _fields_ = (
+        ("r15", ctypes.c_ulonglong),
+        ("r14", ctypes.c_ulonglong),
+        ("r13", ctypes.c_ulonglong),
+        ("r12", ctypes.c_ulonglong),
+        ("r11", ctypes.c_ulonglong),
+        ("r10", ctypes.c_ulonglong),
+        ("r9", ctypes.c_ulonglong),
+        ("r8", ctypes.c_ulonglong),
+        ("rdi", ctypes.c_ulonglong),
+        ("rsi", ctypes.c_ulonglong),
+        ("rbp", ctypes.c_ulonglong),
+        ("rbx", ctypes.c_ulonglong),
+        ("rdx", ctypes.c_ulonglong),
+        ("rcx", ctypes.c_ulonglong),
+        ("rax", ctypes.c_ulonglong),
+        ("trapno", ctypes.c_ulonglong),
+        ("err", ctypes.c_ulonglong),
+        ("rip", ctypes.c_ulonglong),
+        ("cs", ctypes.c_ulonglong),
+        ("rflags", ctypes.c_ulonglong),
+        ("rsp", ctypes.c_ulonglong),
+        ("ss", ctypes.c_ulonglong),
+        ("debug0", ctypes.c_ulonglong),
+        ("debug1", ctypes.c_ulonglong),
+        ("debug2", ctypes.c_ulonglong),
+        ("debug3", ctypes.c_ulonglong),
+        ("debug4", ctypes.c_ulonglong),
+        ("debug5", ctypes.c_ulonglong),
+        ("debug6", ctypes.c_ulonglong),
+        ("debug7", ctypes.c_ulonglong),
+        ("debug8", ctypes.c_ulonglong),
+        ("debug9", ctypes.c_ulonglong),
+        ("debug10", ctypes.c_ulonglong),
+        ("debug11", ctypes.c_ulonglong),
+        ("debug12", ctypes.c_ulonglong),
+        ("debug13", ctypes.c_ulonglong),
+        ("debug14", ctypes.c_ulonglong),
+        ("debug15", ctypes.c_ulonglong),
+    )
+
+amd64_DBG_OFF = (22*ctypes.sizeof(ctypes.c_uint64))
+
+class FreeBSDi386Trace(
+    vtrace.Trace,
+    FreeBSDMixin,
+    v_i386.i386Mixin,
+    v_posix.ElfMixin,
+    v_posix.PosixMixin,
+    v_base.TracerBase):
+
+    def __init__(self):
+        vtrace.Trace.__init__(self)
+        v_base.TracerBase.__init__(self)
+        v_posix.ElfMixin.__init__(self)
+        v_posix.PosixMixin.__init__(self)
+        v_i386.i386Mixin.__init__(self)
+        FreeBSDMixin.__init__(self)
+
+    def platformGetRegCtx(self, tid):
+        ctx = self.archGetRegCtx()
+        u = bsd_regs_i386()
+
+        addr = ctypes.addressof(u)
+        if v_posix.ptrace(PT_GETREGS, tid, addr, 0) != 0:
             raise Exception("ptrace PT_GETREGS failed!")
-        if v_posix.ptrace(PT_GETDBREGS, self.pid, ctypes.addressof(buf)+(GEN_REG_CNT*4), 0) != 0:
+        if v_posix.ptrace(PT_GETDBREGS, tid, addr+i386_DBG_OFF, 0) != 0:
             raise Exception("ptrace PT_GETDBREGS failed!")
-        return buf.raw
 
-    def platformSetRegs(self, buf):
-        #FIXME thread specific
-        if v_posix.ptrace(PT_SETREGS, self.pid, buf, 0) != 0:
+        ctx._rctx_Import(u)
+
+        return ctx
+
+    def platformSetRegCtx(self, tid, ctx):
+        u = bsd_regs_i386()
+        ctx._rctx_Export(u)
+        addr = ctypes.addressof(u)
+        if v_posix.ptrace(PT_SETREGS, self.pid, addr, 0) != 0:
             raise Exception("ptrace PT_SETREGS failed!")
-        if v_posix.ptrace(PT_SETDBREGS, self.pid, buf[(GEN_REG_CNT*4):], 0) != 0:
+        if v_posix.ptrace(PT_SETDBREGS, self.pid, addr+i386_DBG_OFF, 0) != 0:
             raise Exception("ptrace PT_SETDBREGS failed!")
 
-    def getRegisterFormat(self):
-        return "<27L"
 
-    def getRegisterNames(self):
-        return ["fs","es","ds","edi","esi","ebp","isp",
-                "ebx","edx","ecx","eax","trapno","err",
-                "eip","cs","eflags","esp","ss","gs","debug0",
-                "debug1","debug2","debug3","debug4","debug5",
-                "debug6","debug7"]
-                
+class FreeBSDAmd64Trace(
+    vtrace.Trace,
+    FreeBSDMixin,
+    v_amd64.Amd64Mixin,
+    v_posix.ElfMixin,
+    v_posix.PosixMixin,
+    v_base.TracerBase):
+
+    def __init__(self):
+        vtrace.Trace.__init__(self)
+        v_base.TracerBase.__init__(self)
+        v_posix.ElfMixin.__init__(self)
+        v_posix.PosixMixin.__init__(self)
+        v_amd64.Amd64Mixin.__init__(self)
+        FreeBSDMixin.__init__(self)
+
+    def platformGetRegCtx(self, tid):
+        ctx = self.archGetRegCtx()
+        u = bsd_regs_amd64()
+
+        addr = ctypes.addressof(u)
+        if v_posix.ptrace(PT_GETREGS, tid, addr, 0) != 0:
+            raise Exception("ptrace PT_GETREGS failed!")
+        if v_posix.ptrace(PT_GETDBREGS, tid, addr+amd64_DBG_OFF, 0) != 0:
+            raise Exception("ptrace PT_GETDBREGS failed!")
+
+        ctx._rctx_Import(u)
+
+        return ctx
+
+    def platformSetRegCtx(self, tid, ctx):
+        u = bsd_regs_amd64()
+        ctx._rctx_Export(u)
+        addr = ctypes.addressof(u)
+        if v_posix.ptrace(PT_SETREGS, self.pid, addr, 0) != 0:
+            raise Exception("ptrace PT_SETREGS failed!")
+        if v_posix.ptrace(PT_SETDBREGS, self.pid, addr+amd64_DBG_OFF, 0) != 0:
+            raise Exception("ptrace PT_SETDBREGS failed!")
+
 

@@ -1,16 +1,8 @@
 # Copyright (C) 2007 Invisigoth - See LICENSE file for details
 
-import re                                                                                                          
-
 import vtrace
 import vtrace.notifiers as v_notifiers
 import vtrace.rmi as v_rmi
-
-def splitargs(cmdline):
-    cmdline = cmdline.replace('\\\\"', '"').replace('\\"', '')
-    patt = re.compile('\".+?\"|\S+')
-    for item in cmdline.split('\n'):
-        return [s.strip('"') for s in patt.findall(item)]
 
 class TraceManager:
     """
@@ -76,4 +68,11 @@ class TraceManager:
 
     def deregisterNotifier(self, event, notif):
         self.dnotif.deregisterNotifier(event, notif)
+
+    def fireLocalNotifiers(self, event, trace):
+        """
+        Deliver a local event to the DistributedNotifier managing
+        the traces. (used to locally bump notifiers)
+        """
+        self.dnotif.notify(event, trace)
 

@@ -42,13 +42,19 @@ import traceback
 
 import cPickle as pickle
 
+import envi
+import envi.bits as e_bits
+import envi.memory as e_mem
+import envi.registers as e_reg
+import envi.expression as e_expr
+import envi.resolver as e_resolv
+
 import cobra
 import vstruct
 
 remote = None       # If set, we're a vtrace client (set to serverhost)
 cobra_daemon = None
 port = 0x5656
-symbolcache = {} # A list of vtrace symbols key'd by filename
 verbose = False
 
 # Order must match format junk
@@ -82,14 +88,6 @@ FD_EVENT = 5  # Win32 Event/KeyedEvent
 FD_THREAD = 6 # Win32 Thread
 FD_REGKEY = 7 # Win32 Registry Key
 
-# Memory Map Permission Flags
-MM_READ = 0x4
-MM_WRITE = 0x2
-MM_EXEC = 0x1
-MM_SHARED = 0x08
-
-MM_RWX = (MM_READ | MM_WRITE | MM_EXEC)
-
 # Vtrace Symbol Types
 SYM_MISC = -1
 SYM_GLOBAL = 0 # Global (mostly vars)
@@ -105,16 +103,11 @@ VSYM_SIZE = 2
 VSYM_TYPE = 3
 VSYM_FILE = 4
 
-#from vtrace.rmi import *
-#from vtrace.notifiers import *
-#from vtrace.breakpoints import *
-#from vtrace.util import *
-
 from vtrace.rmi import *
 from vtrace.notifiers import *
 from vtrace.breakpoints import *
+from vtrace.watchpoints import *
 import vtrace.util as v_util
-import vtrace.platforms.base as v_base
 
 class PlatformException(Exception):
     """
@@ -135,7 +128,7 @@ class AccessViolation(Exception):
         self.perm = perm
         Exception.__init__(self, "AccessViolation at 0x%.8x (%d)" % (va, perm))
 
-class Trace(Notifier):
+class Trace(e_mem.IMemory, e_reg.RegisterContext, e_resolv.SymbolResolver, object):
     """
     The main tracer object.  A trace instance is dynamically generated using
     this and *many* potential mixin classes.  However, API users should *not*
@@ -148,6 +141,7 @@ class Trace(Notifier):
         self.requires_thread = {}
         self.proxymeth = None # FIXME hack for now...
         self.fireTracerThread()
+
         # The universal place for all modes
         # that might be platform dependant...
         self.modes = {}
@@ -161,17 +155,21 @@ class Trace(Notifier):
         self.initMode("SingleStep", False, "All calls to run() actually just step.  This allows RunForever + SingleStep to step forever ;)")
         self.initMode("FastStep", False, "All stepi() will NOT generate a step event")
 
-        self.fmt = self.getRegisterFormat()
-        self.regnames = self.getRegisterNames()
         self.regcache = None
         self.regcachedirty = False
         self.fb_bp_done = False # A little hack for FastBreak mode
-
+        self.sus_threads = {}   # A dictionary of suspended threads
 
         # Set if we're a server and this trace is proxied
         self.proxy = None
 
-        Notifier.__init__(self)
+        # Set us up with an envi arch module
+        # FIXME eventually we should just inherit one...
+        self.arch = envi.getArchModule()
+
+        e_resolv.SymbolResolver.__init__(self, width=self.arch.getPointerSize())
+        e_mem.IMemory.__init__(self)
+        e_reg.RegisterContext.__init__(self)
 
         # We'll just use our own notify interface to catch some stuff
         # (which also more-or-less guarentees we'll be first notified for these)
@@ -179,8 +177,6 @@ class Trace(Notifier):
 
         # Add event numbers to here for auto-continue
         self.auto_continue = [NOTIFY_LOAD_LIBRARY, NOTIFY_CREATE_THREAD, NOTIFY_UNLOAD_LIBRARY, NOTIFY_EXIT_THREAD, NOTIFY_DEBUG_PRINT]
-
-        self._initLocals()
 
     def execute(self, cmdline):
         """
@@ -233,8 +229,13 @@ class Trace(Notifier):
         don't deliver pending signals for the single step...
         Use the mode FastStep to allow/supress notifier callbacks on step
         """
-        self.requireAttached()
-        self.syncRegs()
+        self.requireNotRunning()
+
+        # Since we don't go through the normal run/wait
+        # code, we have a little house-keeping to do...
+        self.curbp = None
+
+        self._syncRegs()
         self.platformStepi()
         event = self.platformWait()
         self.platformProcessEvent(event)
@@ -246,14 +247,26 @@ class Trace(Notifier):
         Additionally, the argument until may be used to cause execution to continue
         until the specified address is reached (internally uses and removes a breakpoint).
         """
+        self.requireNotRunning()
         if self.getMode("SingleStep", False):
             self.steploop()
+
         else:
             if until != None:
                 self.setMode("RunForever", True)
                 self.addBreakpoint(StopAndRemoveBreak(until))
+
             self._doRun()
             self.wait()
+
+    def runAgain(self, val=True):
+        """
+        The runAgain() method may be used from inside a notifier
+        (Notifier, Breakpoint, Watchpoint, etc...) to inform the trace
+        that once event processing is complete, it should continue
+        running the trace.
+        """
+        self.runagain = val
 
     def kill(self):
         """
@@ -277,10 +290,9 @@ class Trace(Notifier):
         """
         Detach from the currently attached process.
         """
-        self.requireAttached()
         self.requireNotRunning()
         self.fireNotifiers(NOTIFY_DETACH)
-        self.syncRegs()
+        self._syncRegs()
         self.platformDetach()
         self.attached = False
         self.pid = 0
@@ -300,165 +312,128 @@ class Trace(Notifier):
 
         (probably only useful for writting symbol browsers...)
         """
-        return self.resbynorm.keys()
+        return self.getMeta("LibraryBases").keys()
 
     def getSymsForFile(self, libname):
         """
         Return the entire symbol list for the specified
-        filename.
+        normalized library name.
         """
-        res = self.getResolverForFile(libname)
-        if not res:
-            return []
-        return res.symList()
+        self._loadBinaryNorm(libname)
+        sym = self.getSymByName(libname)
+        return sym.getSymList()
 
-    def getSymByName(self, name, libname):
+    def getSymByAddr(self, addr, exact=True):
         """
-        Return a VSymbol() object for the given name
-        from the given binary file.
-        
-        See the docs on VSymbols() for details (in vtrace.symbase)
+        Return an envi Symbol object for an address.
+        Use exact=False to get the nearest previous match.
         """
-        res = self.getResolverForFile(libname)
-        if not res:
-            return None
-        return res.symByName(name)
+        # NOTE: Override this from envi.SymbolResolver to do on-demand
+        # file parsing.
 
-    def getSymByAddr(self, addr):
-        """
-        Return the *closest* VSymbol prior to this but ONLY
-        from within the symbol resolver for the filename
-        which is mapped at that address.
+        r = e_resolv.SymbolResolver.getSymByAddr(self, addr, exact=exact)
+        if r != None:
+            return r
 
-        See the docs on VSymbols() for details (in vtrace.symbase)
-        """
-        map = self.getMap(addr)
+        # See if we need to parse the file.
+        map = self.getMemoryMap(addr)
         if map == None:
             return None
-        fname = map[3]
-        if not fname:
+
+        va,size,perms,fname = map
+
+        if not self._loadBinary(fname):
             return None
-        res = self.getResolverForFile(os.path.basename(fname))
-        if not res:
-            return None
-        return res.symByAddr(addr)
 
+        # Take a second shot after parsing
+        return e_resolv.SymbolResolver.getSymByAddr(self, addr, exact=exact)
 
-    def getRegisterByName(self, name):
+    def getSymByName(self, name):
         """
-        Return an int value for the specified
-        register by name.
+        Return an envi.Symbol object for the given name (or None)
         """
-        self.requireAttached()
-        self.cacheRegs()
-        val = self.regcache.get(name, None)
-        if val == None:
-            raise Exception("ERROR - Unknown register name %s" % name)
-        return val
+        self._loadBinaryNorm(name)
+        return e_resolv.SymbolResolver.getSymByName(self, name)
 
-    def setRegisterByName(self, name, value):
+    def getRegisterContext(self, threadid=None):
         """
-        Set a target register by name to the int()
-        (or possibly long) value  specified.
+        Retrieve the envi.registers.RegisterContext object for the
+        specified thread.  Use this API to iterate over threads
+        register values without setting the global tracer thread context.
         """
-        self.cacheRegs()
-        if not self.regcache.has_key(name):
-            raise Exception("Unknown Register %s" % name)
-        self.regcache[name] = long(value)
-        self.regcachedirty = True
+        if threadid == None:
+            threadid = self.getMeta("ThreadId")
+        return self._cacheRegs(threadid)
 
-    def getRegisters(self):
-        """
-        Return a dict entry of the "user" registers for this process.
-        """
-        self.requireAttached()
-        self.cacheRegs()
-        return dict(self.regcache)
+#######################################################################
+#
+# We mirror the RegisterContext API using our own thread index based
+# cache.  These APIs must stay in sync with envi.registers.RegisterContext
+# NOTE: for now we only need to over-ride get/setRegister because all the
+# higher level APIs call them.
+#
 
-    def setRegisters(self, newregs):
-        """
-        Set any registers specified in the dict newregs to their int values.
-        (only the specified registers are effected)
-        """
-        self.requireAttached()
-        for name,val in newregs.items():
-            self.setRegisterByName(name, val)
+    def getRegister(self, idx):
+        ctx = self.getRegisterContext()
+        return ctx.getRegister(idx)
 
-    def searchMemory(self, needle):
-        """
-        A quick cheater way to searchMemoryRange() for each
-        of the current memory maps.
-        """
-        results = []
-        for map in self.getMaps():
-            # On most platforms, memory you can't
-            # read is in kernel space, and you can't
-            # read it with a debugger either ;)
-            if not map[2] | MM_READ:
-                continue
-            try:
-                results.extend(self.searchMemoryRange(needle, map[0],map[1]))
-            except:
-                pass # Some platforms dont let debuggers read non-readable mem
-        return results
+    def setRegister(self, idx, value):
+        ctx = self.getRegisterContext()
+        ctx.setRegister(idx, value)
 
-    def searchMemoryRange(self, needle, address, size):
-        """
-        Search the specified memory range (address -> size)
-        for the string needle.   Return a list of addresses
-        where the match occurs.
-        """
-        results = []
-        memory = self.readMemory(address, size)
-        offset = 0
-        while offset < size:
-            loc = memory.find(needle, offset)
-            if loc == -1: # No more to be found ;)
-                break
-            results.append(address+loc)
-            offset = loc+1 # Skip one past our matcher
+#######################################################################
 
-        return results
-
-    def allocateMemory(self, size, perms=MM_RWX, suggestaddr=0):
+    def allocateMemory(self, size, perms=e_mem.MM_RWX, suggestaddr=0):
         """
         Allocate a chunk of memory inside the target process' address
         space.  Memory wil be mapped rwx unless otherwise specified with
-        perms=MM_FOO values. Optionally you may *suggest* an address
+        perms=envi.memory.MM_FOO values. Optionally you may *suggest* an address
         to the allocator, but there is no guarentee.  Returns the mapped
         memory address.
         """
-        self.requireAttached()
         self.requireNotRunning()
+        self.mapcache = None # We may have a new memory map
         return self.platformAllocateMemory(size, perms=perms, suggestaddr=suggestaddr)
+
+    def protectMemory(self, va, size, perms):
+        """
+        Change the page protections on the specified region of memory.
+        See envi.memory for perms values.
+        """
+        self.requireNotRunning()
+        self.mapcache = None # We may have new memory protections
+        return self.platformProtectMemory(va, size, perms)
 
     def readMemory(self, address, size):
         """
         Read memory from address.  Areas that are NOT valid memory will be read
         back as \x00s (this probably goes in a mixin soon)
         """
-        self.requireAttached()
+        self.requireNotRunning()
         return self.platformReadMemory(long(address), long(size))
-
-    def readMemoryFormat(self, address, fmt):
-        """
-        This works much like python's struct package, only it doesn't
-        suck. Seriously, fix that nonsense pydevs!
-        """
-        size = struct.calcsize(fmt)
-        bytes = self.readMemory(address, size)
-        return struct.unpack(fmt, bytes)
 
     def writeMemory(self, address, bytes):
         """
         Write the given bytes to the address in the current trace.
         """
-        self.requireAttached()
+        self.requireNotRunning()
         self.platformWriteMemory(long(address), bytes)
 
-    def writeMemoryFormat(self, address, fmt, *args):
-        buf = struct.pack(fmt, *args)
-        self.writeMemory(address, buf)
+    def searchMemory(self, needle):
+        """
+        Search all of process memory for a sequence of bytes.
+        """
+        ret = e_mem.IMemory.searchMemory(self, needle)
+        self.setMeta("search", ret)
+        return ret
+
+    def searchMemoryRange(self, needle, address, size):
+        """
+        Search a memory range for the specified sequence of bytes
+        """
+        ret = e_mem.IMemory.searchMemoryRange(self, needle, address, size)
+        self.setMeta("search", ret)
+        return ret
 
     def setMeta(self, name, value):
         """
@@ -526,6 +501,7 @@ class Trace(Notifier):
         Inject a shared object into the target of the trace.  So, on windows
         this is easy with InjectDll and on *nix... it's.. fugly...
         """
+        self.requireNotRunning()
         self.platformInjectSo(filename)
 
     def ps(self):
@@ -536,42 +512,10 @@ class Trace(Notifier):
         """
         return self.platformPs()
 
-    def addWatchpoint(self, watchpoint):
-        """
-        Add a "break on access" watch-point provided that the hardware
-        has support and sufficient resources are aviailable.  The "watchpoint"
-        argument must extend the vtrace.watchpoints.Watchpoint object and will
-        have it's "notify" method called when hit...  This method returns
-        the ID assigned to the watch point.
-        """
-        # Watchpoints are handled by the breakpoint subsystem...
-        watchpoint.id = self.nextBpId()
-        addr = watchpoint.resolveAddress(self)
-        if addr == None:
-            self.deferredwatch.append(watchpoint)
-        else:
-            self.archAddWatchpoint(addr)
-            self.watchpoints[addr] = watchpoint
-
-    def removeWatchpoint(self, id):
-        """
-        Remove a previously added watchpoint by id.
-        """
-        for wp in self.deferredwatch:
-            if wp.getId() == id:
-                self.deferredwatch.remove(wp)
-                return
-
-        for addr,wp in self.watchpoints.items():
-            if wp.getId() == id:
-                self.watchpoints.pop(addr)
-                self.archRemWatchpoint(addr)
-                return
-
     def addBreakpoint(self, breakpoint):
         """
-        Add a breakpoint to the trace.  The "breakpoint" argument
-        is a vtrace Breakpoint object or something that extends it.
+        Add a breakpoint/watchpoint to the trace.  The "breakpoint" argument
+        is a vtrace Breakpoint/Watchpoint object or something that extends it.
 
         To add a basic breakpoint use trace.addBreakpoint(vtrace.Breakpoint(address))
         NOTE: expression breakpoints do *not* get evaluated in fastbreak mode
@@ -581,11 +525,14 @@ class Trace(Notifier):
         breakpoint.id = self.nextBpId()
         addr = breakpoint.resolveAddress(self)
         if addr == None:
+            self.bpbyid[breakpoint.id] = breakpoint
             self.deferred.append(breakpoint)
-        else:
-            if self.breakpoints.has_key(addr):
-                raise Exception("ERROR: Duplicate break for address 0x%.8x" % addr)
-            self.breakpoints[addr] = breakpoint
+            return breakpoint.id
+
+        if self.breakpoints.has_key(addr):
+            raise Exception("ERROR: Duplicate break for address 0x%.8x" % addr)
+        self.bpbyid[breakpoint.id] = breakpoint
+        self.breakpoints[addr] = breakpoint
 
         return breakpoint.id
             
@@ -594,16 +541,26 @@ class Trace(Notifier):
         Remove the breakpoint with the specified ID
         """
         self.requireAttached()
-        for bp in self.deferred:
-            if bp.getId() == id:
-                bp.deactivate(self)
+        bp = self.bpbyid.pop(id, None)
+        if bp != None:
+            bp.deactivate(self)
+            if bp in self.deferred:
                 self.deferred.remove(bp)
-                return
+            else:
+                self.breakpoints.pop(bp.address, None)
 
-        for addr,bp in self.breakpoints.items():
-            if bp.getId() == id:
-                bp.deactivate(self)
-                self.breakpoints.pop(addr, None)
+            # If the bp is also curbp, set curbp to None
+            if self.curbp == bp:
+                self.curbp = None
+
+        # Remove cached breakpoint code
+        Breakpoint.bpcodeobj.pop(id, None)
+
+    def getCurrentBreakpoint(self):
+        """
+        Return the current breakpoint otherwise None
+        """
+        return self.curbp
 
     def getBreakpoint(self,id):
         """
@@ -614,24 +571,13 @@ class Trace(Notifier):
         and would then be *coppies* of the bp objects. (use the trace's
         setBreakpointCode() instead).
         """
-        for bp in self.deferred:
-            if bp.getId() == id:
-                bp.bpcodeobj = None
-                return bp
-        for bp in self.breakpoints.values():
-            if bp.getId() == id:
-                bp.bpcodeobj = None
-                return bp
-        return None
+        return self.bpbyid.get(id)
 
     def getBreakpoints(self):
         """
         Return a list of the current breakpoints.
         """
-        ret = self.breakpoints.values() + self.deferred
-        for bp in ret:
-            bp.bpcodeobj = None
-        return ret
+        return self.bpbyid.values()
 
     def getBreakpointEnabled(self, bpid):
         """
@@ -663,14 +609,20 @@ class Trace(Notifier):
         vdb interface to quick script breakpoint code.  Use this method
         to set the python code for this breakpoint.
         """
-        self.getBreakpoint(bpid).setBreakpointCode(pystr)
+        bp = self.getBreakpoint(bpid)
+        if bp == None:
+            raise Exception("Breakpoint %d Not Found" % bpid)
+        bp.setBreakpointCode(pystr)
 
     def getBreakpointCode(self, bpid):
         """
         Return the python string of user specified code that will run
         when this breakpoint is hit.
         """
-        return self.getBreakpoint(bpid).getBreakpointCode()
+        bp = self.getBreakpoint(bpid)
+        if bp != None:
+            return bp.getBreakpointCode()
+        return None
 
     def call(self, address, args, convention=None):
         """
@@ -684,6 +636,7 @@ class Trace(Notifier):
         Additionally, a "convention" string may be specified that the underlying
         platform may be able to interpret...
         """
+        self.requireNotRunning()
         return self.platformCall(address, args, convention)
 
     def registerNotifier(self, event, notifier):
@@ -716,6 +669,7 @@ class Trace(Notifier):
         Just a quick method to throw an error if the
         tracer is already running...
         """
+        self.requireAttached()
         if self.isRunning():
             raise Exception("ERROR - Request invalid for running trace")
 
@@ -732,50 +686,22 @@ class Trace(Notifier):
         Get a list of (fd,type,bestname) pairs.  This is MOSTLY useful
         for HUMON consumtion...  or giving HUMONs consumption...
         """
-        self.requireAttached()
+        self.requireNotRunning()
         if not self.fds:
             self.fds = self.platformGetFds()
         return self.fds
 
-    def getMaps(self):
+    def getMemoryMaps(self):
         """
         Return a list of the currently mapped memory for the target
         process.  This is acomplished by calling the platform's
         platformGetMaps() mixin method.  This will also cache the
         results until CONTINUE.  The format is (addr,len,perms,file).
         """
+        self.requireNotRunning()
         if not self.mapcache:
             self.mapcache = self.platformGetMaps()
         return self.mapcache
-
-    def getMap(self, address):
-        """
-        Get the mmap for the target address from the current Trace.
-        This will return None if the address is not in any map
-        (this can also be used as a cheater isMemoryValid() type routine)
-        """
-        address = long(address)
-        maps = self.getMaps()
-        for map in maps:
-            base = map[0]
-            mlen = map[1]
-            if address >= base and address < (base+mlen):
-                return map
-
-        return None
-
-    def getMapBase(self, filename):
-        """
-        Return the base map address for the
-        memory map which is backed by the given
-        file name.
-        """
-        maps = self.getMaps()
-        for map in maps:
-            if map[3] == filename:
-                return map[0]
-
-        raise Exception("ERROR - Unknown map name %s\n" % filename)
 
     def isAttached(self):
         """
@@ -807,18 +733,22 @@ class Trace(Notifier):
         if event in self.auto_continue:
             self.auto_continue.remove(event)
 
-    def parseExpression(self, expression, noraise=False):
+    def getAutoContinueList(self):
         """
-        This is a convenience wrapper for the VtraceExpression
-        object.  It returns the current evaluation of the expression
-        right now.  This can raise if invalid syntax or unknown symbols
-        are used.
+        Retrieve the list of vtrace notification events
+        that will be auto-continued.
+        """
+        return list(self.auto_continue)
 
-        See the docs for the VtraceExpression object for details on the
-        expression syntax...
+    def parseExpression(self, expression):
         """
-        e = VtraceExpression(expression)
-        return e.evaluate(self, noraise=noraise)
+        Parse a python expression with many useful helpers mapped
+        into the execution namespace.
+
+        Example: trace.parseExpression("ispoi(ecx+ntdll.RtlAllocateHeap)")
+        """
+        locs = VtraceExpressionLocals(self)
+        return long(e_expr.evaluate(expression, locs))
 
     def sendBreak(self):
         """
@@ -837,44 +767,6 @@ class Trace(Notifier):
             while self.isRunning():
                 time.sleep(0.01)
 
-    def getProgramCounter(self):
-        """
-        An architecture independant way to get the value for the
-        program counter on this platform (ie "eip" for all you 
-        intel only neordz)  Breakpoint subsystem uses this to be
-        independant on my dreamcast...
-        """
-        self.requireAttached()
-        name = self.archGetPcName()
-        return self.getRegisterByName(name)
-
-    def setProgramCounter(self, value):
-        """
-        Set the current instruction pointer.  See getProgramCounter()
-        for why this exists.
-        """
-        self.requireAttached()
-        name = self.archGetPcName()
-        return self.setRegisterByName(name,value)
-
-    def getStackCounter(self):
-        """
-        An architecture independant way to get the current stack pointer
-        value
-        """
-        self.requireAttached()
-        name = self.archGetSpName()
-        return self.getRegisterByName(name)
-
-    def setStackCounter(self, value):
-        """
-        An architecture independant way to set the current stack pointer
-        value
-        """
-        self.requireAttached()
-        name = self.archGetSpName()
-        return self.setRegisterByName(name, value)
-
     def getStackTrace(self):
         """
         Returns a list of (instruction pointer, stack frame) tuples.
@@ -882,8 +774,8 @@ class Trace(Notifier):
         be (-1,-1).  Otherwise most platforms end up with 0,0 as
         the top stack frame
         """
-        #FIXME this should be a platform call!
-        raise Exception("ERROR - Platform must implement this")
+        # FIXME thread id argument!
+        return self.archGetStackTrace()
 
     def getThreads(self):
         """
@@ -905,200 +797,88 @@ class Trace(Notifier):
         """
         if threadid not in self.getThreads():
             raise Exception("ERROR: Invalid threadid chosen: %d" % threadid)
-        self.syncRegs()
+        self.requireNotRunning()
         self.platformSelectThread(threadid)
         self.setMeta("ThreadId", threadid)
 
-    def takeSnapshot(self):
+    def isThreadSuspended(self, threadid):
         """
-        Take a snapshot of the process from the current state and return
-        a reference to a tracer which wraps a "snapshot" or "core file".
+        Used to determine if a thread is suspended.
         """
-        sd = dict()
-        orig_thread = self.getMeta("ThreadId")
+        return self.sus_threads.get(threadid, False)
 
-        regs = dict()
-        stacktrace = dict()
+    def suspendThread(self, threadid):
+        """
+        Suspend a thread by ID.  This will mean that on continuing
+        the trace, the suspended thread will not be scheduled.
+        """
+        self.requireNotRunning()
+        if self.sus_threads.get(threadid):
+            raise Exception("The specified thread is already suspended")
+        if threadid not in self.getThreads().keys():
+            raise Exception("There is no thread %d!" % threadid)
+        self.platformSuspendThread(threadid)
+        self.sus_threads[threadid] = True
 
-        for thrid,tdata in self.getThreads().items():
-            self.selectThread(thrid)
-            regs[thrid] = self.getRegisters()
-            try:
-                stacktrace[thrid] = self.getStackTrace()
-            except Exception, msg:
-                print >> sys.stderr, "WARNING: Failed t get stack trace for thread 0x%.8x" % thrid
+    def resumeThread(self, threadid):
+        """
+        Resume a suspended thread.
+        """
+        self.requireNotRunning()
+        if not self.sus_threads.get(threadid):
+            raise Exception("The specified thread is not suspended")
+        self.platformResumeThread(threadid)
+        self.sus_threads.pop(threadid)
 
-        mem = dict()
-        for base,size,perms,fname in self.getMaps():
-            try:
-                mem[base] = self.readMemory(base, size)
-            except Exception, msg:
-                print >> sys.stderr, "WARNING: Can't snapshot memmap at 0x%.8x (%s)" % (base,msg)
-
-        # If the contents here change, change the version...
-        sd['version'] = 1
-        sd['threads'] = self.getThreads()
-        sd['regs'] = regs
-        sd['maps'] = self.getMaps()
-        sd['mem'] = mem
-        sd['meta'] = copy.deepcopy(self.metadata)
-        sd['pcname'] = self.archGetPcName()
-        sd['spname'] = self.archGetSpName()
-        sd['stacktrace'] = stacktrace
-        sd['exe'] = self.getExe()
-        sd['fds'] = self.getFds()
-
-        if orig_thread != -1:
-            self.selectThread(orig_thread)
-
-        return TraceSnapshot(snapdict=sd)
+    def injectThread(self, pc):
+        """
+        Create a new thread inside the target process.  This thread
+        will begin execution on the next process run().
+        """
+        self.requireNotRunning()
+        #FIXME platformInjectThread()
+        pass
 
     def getStruct(self, sname, address):
         """
         Retrieve a vstruct structure populated with memory from
         the specified address.  Returns a standard vstruct object.
         """
-        cls = vstruct.getStructClass(sname)
-        size = vstruct.calcsize(cls)
-        bytes = self.readMemory(address, size)
-        return cls(bytes)
+        vs = vstruct.getStructure(sname)
+        bytes = self.readMemory(address, len(vs))
+        vs.vsParse(bytes)
+        return vs
 
-class TraceSnapshot(Trace, v_base.BasePlatformMixin, v_base.UtilMixin):
-    """
-    A tracer snapshot is similar to a traditional "core file" except that
-    you may also have memory only snapshots that are never written to disk.
-
-    TraceSnapshots allow you to take a picture of a process from a given point
-    in it's execution and manipulate/test from there or save it to disk for later
-    analysis...
-    """
-    def __init__(self, filename=None, snapdict=None):
-        Trace.__init__(self)
-        if filename == None and snapdict == None:
-            raise Exception("ERROR: TraceSnapshot needs either filename or snapdict!")
-
-        if filename:
-            sfile = file(filename, "rb")
-            snapdict = pickle.load(sfile)
-
-        self.s_snapdict = snapdict
-
-        # a seperate parser for each version...
-        if snapdict['version'] == 1:
-            self.s_version = snapdict['version']
-            self.s_threads = snapdict['threads']
-            self.s_regs = snapdict['regs']
-            self.s_maps = snapdict['maps']
-            self.s_mem = snapdict['mem']
-            self.metadata = snapdict['meta']
-            self.s_spname = snapdict['spname']
-            self.s_pcname = snapdict['pcname']
-            self.s_stacktrace = snapdict['stacktrace']
-            self.s_exe = snapdict['exe']
-            self.s_fds = snapdict['fds']
-        else:
-            raise Exception("ERROR: Unknown snapshot version!")
-
-        #FIXME hard-coded page size!
-        self.s_map_lookup = {}
-        for map in self.s_maps:
-            for i in range(map[0],map[0] + map[1], 4096):
-                self.s_map_lookup[i] = map
-
-        self.attached = True
-        # So that we pickle
-        self.bplock = None
-        self.thread = None
-
-    def saveToFile(self, filename):
+    def setVariable(self, name, value):
         """
-        Save a snapshot to file for later reading in...
+        Set a named variable in the trace which may be used in
+        subsequent VtraceExpressions.
+
+        Example:
+        trace.setVariable("whereiam", trace.getProgramCounter())
         """
-        #import zlib
-        f = file(filename, "wb")
-        pickle.dump(self.s_snapdict, f)
-        #f.write(zlib.compress(rawbytes))
-        f.close()
+        self.localvars[name] = long(value)
 
-    def getMap(self, addr):
-        base = addr & 0xfffff000
-        return self.s_map_lookup.get(base, None)
+    def getVariable(self, name):
+        """
+        Get the value of a previously set variable name.
+        (or None on not found)
+        """
+        return self.localvars.get(name)
 
-    def platformGetFds(self):
-        return self.s_fds
+    def getVariables(self):
+        """
+        Get the dictionary of named variables.
+        """
+        return self.localvars
 
-    def getExe(self):
-        return self.s_exe
-
-    def getStackTrace(self):
-        tid = self.getMeta("ThreadId")
-        tr = self.s_stacktrace.get(tid, None)
-        if tr == None:
-            raise Exception("ERROR: Invalid thread id specified")
-        return tr
-
-    def archGetSpName(self):
-        return self.s_spname
-
-    def archGetPcName(self):
-        return self.s_pcname
-
-    def platformGetMaps(self):
-        return self.s_maps
-
-    def getRegisterFormat(self):
-        # Fake this out for the Trace constructor
-        return ""
-
-    def getRegisterNames(self):
-        return []
-
-    def platformGetThreads(self):
-        return self.s_threads
-
-
-    def platformReadMemory(self, address, size):
-        map = self.getMap(address)
-        if map == None:
-            raise Exception("ERROR: platformReadMemory says no map for 0x%.8x" % address)
-        offset = address - map[0] # Base address
-        mapbytes = self.s_mem.get(map[0], None)
-        if mapbytes == None:
-            raise PlatformException("ERROR: Memory map at 0x%.8x is not backed!" % map[0])
-        if len(mapbytes) == 0:
-            raise PlatformException("ERROR: Memory Map at 0x%.8x is backed by ''" % map[0])
-
-        ret = mapbytes[offset:offset+size]
-        rlen = len(ret)
-        # We may have a cross-map read, just recurse for the rest
-        if rlen != size:
-            ret += self.platformReadMemory(address+rlen, size-rlen)
-        return ret
-
-    def platformWriteMemory(self, address, bytes):
-        map = self.getMap(address)
-        if map == None:
-            raise Exception("ERROR: platformWriteMemory says no map for 0x%.8x" % address)
-        offset = address - map[0]
-        mapbytes = self.s_mem[map[0]]
-        self.s_mem[map[0]] = mapbytes[:offset] + bytes + mapbytes[offset+len(bytes):]
-
-    def platformDetach(self):
-        pass
-
-    # Over-ride register *caching* subsystem to store/retrieve
-    # register information in pure dictionaries
-    def cacheRegs(self):
-        if self.regcache == None:
-            tid = self.getMeta("ThreadId")
-            self.regcache = self.s_regs.get(tid)
-
-    def syncRegs(self):
-        if self.regcachedirty:
-            tid = self.getMeta("ThreadId")
-            self.s_regs[tid] = self.regcache
-            self.regcachedirty = False
-        self.regcache = None
+    def hex(self, value):
+        """
+        Much like the python hex routine, except this will automatically
+        pad the value's string length out to pointer width.
+        """
+        w = self.arch.getPointerSize()
+        return e_bits.hex(value, width)
 
 class TraceGroup(Notifier, v_util.TraceManager):
     """
@@ -1229,74 +1009,38 @@ class TraceGroup(Notifier, v_util.TraceManager):
         if event == NOTIFY_EXIT:
             self.delTrace(trace.getPid())
 
-class VtraceExpression:
+class VtraceExpressionLocals(e_expr.MemoryExpressionLocals):
     """
-    A vtrace expression is essentially python code with a bunch of metadata
-    mapped into the code evaluation namespace.  Currently, every method listed
-    in this class except "evaluate" also gets mapped into the space.  This means
-    that the expressions may call methods from this object as though they were
-    functions ie. the expression:
-
-    mapbase(<address>)
-
-    will call the mapbase method from this object...
-
-    Additionally the following items are mapped directly into the namespace for
-    evaluation:
-
-    * Registers
-        Mapped in by name
-
-    * Symbol Resolvers 
-        They are accessable by the "normalized libname" so, kernel32.dll is "kernel32"
-        and /usr/lib/libpthread-2.0.40.so is "libpthread".  These resolvers may be
-        dereferenced to get symbols by name.  For example the expression "kernel32.CloseHandle"
-        will return the address of the CloseHandle symbol from kernel32
-
+    A class which serves as the namespace dictionary during the
+    evaluation of an expression on a tracer.
     """
-    def __init__(self, expression):
-        self.trace = None
-        self.expression = expression
-
-    def __str__(self):
-        return self.expression
-
-    def evaluate(self, trace, noraise=False):
-        """
-        Evaluate the expression with metadata/symbols/registers/etc
-        from the given tracer.  This *will* raise exceptions on 
-        parse errors or invalid symbols etc unless you specify
-        noraise at which point it will return None.
-        """
-        methmap = {
+    def __init__(self, trace):
+        e_expr.MemoryExpressionLocals.__init__(self, trace, symobj=trace)
+        self.trace = trace
+        self.update({
+                'trace':trace,
+                'vtrace':vtrace
+        })
+        self.update({
+            "struct":self.struct,
             "frame":self.frame,
-            "section":self.section,
-            "sectionlen":self.sectionlen,
             "teb":self.teb,
-            "poi":self.poi,
-            "maplen":self.maplen,
-            "mapbase":self.mapbase,
-            "struct":self.struct
-            }
+            "bp":self.bp,
+            "meta":self.meta,
+        })
 
-        try:
-            locs = {}
-            self.trace = trace
-            locs.update(trace.getRegisters())
-            locs.update(methmap)
-            locs.update(trace.resbynorm)
-            locs["trace"] = trace
-            if trace.getMeta("Platform", "Windows"):
-                locs["peb"] = trace.getMeta("PEB")
-            x = long(eval(self.expression,{},locs))
-            self.trace = None
-            return x
-        except Exception, e:
-            self.trace = None
-            if noraise:
-                if vtrace.verbose: print e
-                return None
-            raise
+    def __getitem__(self, name):
+        # Check registers
+        regs = self.trace.getRegisters()
+        r = regs.get(name, None)
+        if r != None:
+            return r
+        # Check local variables
+        locs = self.trace.getVariables()
+        r = locs.get(name, None)
+        if r != None:
+            return r
+        return e_expr.MemoryExpressionLocals.__getitem__(self, name)
 
     def struct(self, sname, saddr):
         """
@@ -1317,35 +1061,7 @@ class VtraceExpression:
         stack = self.trace.getStackTrace()
         return stack[index][1]
 
-    def section(self, secname, filename=None):
-        """
-        Return the address of the section specified, if 
-        filename is specified, use only that file to resolve
-        the section name.
-
-        Usage: section(<secname> [, <filename>])
-        """
-        if not filename:
-            filename = self.trace.getExe()
-        sym = self.trace.getSymByName(secname, filename)
-        return long(sym)
-
-    def sectionlen(self, secname, filename=None):
-        """
-        Return the length of the requested section. If not present
-        the "libname" defaults to the primary executable.  If
-        *present*, the libname must be a "normalized" library
-        name (kernel32.dll == kernel32, /usr/lib/libfoo.1.30-3.so == libfoo).
-
-        Usage: sectionlen(<secname> [,<libname>])
-        """
-        if not filename:
-            filename = self.trace.getExe()
-
-        sym = self.trace.getSymByName(secname, filename)
-        return long(sym)
-
-    def teb(self, threadnum=-1):
+    def teb(self, threadnum=None):
         """
         The expression teb(threadid) will return whatever the
         platform stores as the int for threadid.  In the case
@@ -1353,7 +1069,7 @@ class VtraceExpression:
         stack base or whatever.  If threadid is left out, it
         uses the threadid of the current thread context.
         """
-        if threadnum < 0:
+        if threadnum == None:
             # Get the thread ID of the current Thread Context
             threadnum = self.trace.getMeta("ThreadId")
 
@@ -1363,36 +1079,24 @@ class VtraceExpression:
 
         return teb
 
-    def poi(self, address):
+    def bp(self, bpid):
         """
-        When expressions contain "poi(ebp)" this will return
-        the address pointed to by ebp.
+        The expression bp(0) returns the resolved address of the given
+        breakpoint
         """
-        return self.trace.readMemoryFormat(address, "P")[0]
+        bp = self.trace.getBreakpoint(bpid)
+        if bp == None:
+            raise Exception("Unknown Breakpoint ID: %d" % bpid)
+        return bp.resolveAddress(self.trace)
 
-    def maplen(self, address):
+    def meta(self, name):
         """
-        The expression maplen(address) returns the length of the
-        memory mapped area containing "address".
-        """
-        map = self.trace.getMap(address)
-        if not map:
-            raise Exception("ERROR - un-mapped address in maplen()")
-        return map[1]
+        An expression friendly (terse) way to get trace metadata
+        (equiv to trace.getMeta(name))
 
-    def mapbase(self, address):
+        Example: meta("foo")
         """
-        The expression mapbase(address) returns the base address of the
-        memory mapped area containing "address"
-        """
-        map = self.trace.getMap(address)
-        if not map:
-            raise Exception("ERROR - un-mapped address in mapbase()")
-        return map[0]
-
-############################################################
-# Platform mixins get thrown together here to form voltron
-############################################################
+        return self.trace.getMeta(name)
 
 def getTrace():
     """
@@ -1405,110 +1109,94 @@ def getTrace():
     if remote: #We have a remote server!
         return getRemoteTrace()
 
-
     os_name = platform.system() # Like "Linux", "Darwin","Windows"
-    arch = platform.machine()   # 'i386','ppc', etc...
-    # This bits calculation is not safe for 128 bit systems
-    bits = int(platform.architecture()[0][:2])
-
-    ilist = [object,] # Inheritors list
-    ilist.append(Trace)
-    ilist.append(v_base.BasePlatformMixin)
-    ilist.append(v_base.UtilMixin)
+    arch = envi.getCurrentArch()
 
     if os_name == "Linux":
-        import vtrace.platforms.posix as v_posix
         import vtrace.platforms.linux as v_linux
-        ilist.append(v_posix.PosixMixin)
-        ilist.append(v_posix.ElfMixin)
-        if arch == "x86_64":
-            #Order matters.
-            import vtrace.archs.amd64 as v_amd64
-            ilist.append(v_amd64.Amd64Mixin)
-            ilist.append(v_posix.PtraceMixin)
-            ilist.append(v_linux.LinuxMixin)
-            ilist.append(v_linux.LinuxAmd64Registers)
+        if arch == "amd64":
+            return v_linux.LinuxAmd64Trace()
 
-        elif arch in ("i386","i486","i586","i686"):
-            import vtrace.archs.intel as v_intel
-            ilist.append(v_intel.IntelMixin)
-            ilist.append(v_posix.PtraceMixin)
-            ilist.append(v_linux.LinuxMixin)
-            ilist.append(v_linux.LinuxIntelRegisters)
+        elif arch == "i386":
+            return v_linux.Linuxi386Trace()
 
         else:
             raise Exception("Sorry, no linux support for %s" % arch)
 
     elif os_name == "FreeBSD":
-        import vtrace.platforms.posix as v_posix
+
         import vtrace.platforms.freebsd as v_freebsd
-        ilist.append(v_posix.PosixMixin)
-        ilist.append(v_posix.ElfMixin)
-        if arch in ("i386","i486","i586","i686"):
-            import vtrace.archs.intel as v_intel
-            ilist.append(v_intel.IntelMixin)
-            ilist.append(v_freebsd.FreeBSDMixin)
-            ilist.append(v_freebsd.FreeBSDIntelRegisters)
+
+        if arch == "i386":
+            return v_freebsd.FreeBSDi386Trace()
+
+        elif arch == "amd64":
+            return v_freebsd.FreeBSDAmd64Trace()
+
         else:
             raise Exception("Sorry, no FreeBSD support for %s" % arch)
 
+        #import vtrace.platforms.posix as v_posix
+        #import vtrace.platforms.freebsd as v_freebsd
+        #ilist.append(v_posix.PosixMixin)
+        #ilist.append(v_posix.ElfMixin)
+        #if arch == "i386":
+            #import vtrace.archs.intel as v_intel
+            #ilist.append(v_intel.i386Mixin)
+            #ilist.append(v_freebsd.FreeBSDMixin)
+            #ilist.append(v_freebsd.FreeBSDIntelRegisters)
+        #else:
+            #raise Exception("Sorry, no FreeBSD support for %s" % arch)
+
     elif os_name == "sunos5":
-        print "SOLARIS SUPPORT ISNT DONE"
-        import vtrace.platforms.posix as v_posix
-        import vtrace.platforms.solaris as v_solaris
-        ilist.append(v_posix.PosixMixin)
-        if arch == "i86pc":
-            import vtrace.archs.intel as v_intel
-            ilist.append(v_intel.IntelMixin)
-            ilist.append(v_solaris.SolarisMixin)
-            ilist.append(v_solaris.SolarisIntelMixin)
+        raise Exception("Solaris needs porting!")
+        #import vtrace.platforms.posix as v_posix
+        #import vtrace.platforms.solaris as v_solaris
+        #ilist.append(v_posix.PosixMixin)
+        #if arch == "i386":
+            #import vtrace.archs.intel as v_intel
+            #ilist.append(v_intel.i386Mixin)
+            #ilist.append(v_solaris.SolarisMixin)
+            #ilist.append(v_solaris.Solarisi386Mixin)
 
     elif os_name == "Darwin":
-        print "DARWIN SUPPORT ISNT DONE"
-        if 9 not in os.getgroups():
-            raise Exception("You must be in the procmod group!")
-        import vtrace.platforms.darwin as v_darwin
-        import vtrace.platforms.posix as v_posix
-        ilist.append(v_posix.PosixMixin)
-        ilist.append(v_posix.PtraceMixin)
-        ilist.append(v_darwin.DarwinMixin)
-        ilist.append(v_darwin.MachoMixin)
-        if arch == "i386":
-            import vtrace.archs.intel as v_intel
-            ilist.append(v_intel.IntelMixin)
-            ilist.append(v_darwin.DarwinIntel32Registers)
-        elif arch == "powerpc":
-            import vtrace.archs.ppc as v_ppc
-            ilist.append(v_ppc.PpcMixin)
-            ilist.append(v_darwin.DarwinPpc32Registers)
-        else:
-            raise Exception("WTF?!?!  You got Darwin running on %s?!?>!?" % arch)
+        raise Exception("Darwin needs porting!")
+        #print "DARWIN SUPPORT ISNT DONE"
+        #if 9 not in os.getgroups():
+            #raise Exception("You must be in the procmod group!")
+        #import vtrace.platforms.darwin as v_darwin
+        #import vtrace.platforms.posix as v_posix
+        #ilist.append(v_posix.PosixMixin)
+        #ilist.append(v_posix.PtraceMixin)
+        #ilist.append(v_darwin.DarwinMixin)
+        #ilist.append(v_darwin.MachoMixin)
+        #if arch == "i386":
+            #import vtrace.archs.i386 as v_i386
+            #ilist.append(v_i386.i386Mixin)
+            #ilist.append(v_darwin.DarwinIntel32Registers)
+        #elif arch == "powerpc":
+            #import vtrace.archs.ppc as v_ppc
+            #ilist.append(v_ppc.PpcMixin)
+            #ilist.append(v_darwin.DarwinPpc32Registers)
+        #else:
+            #raise Exception("WTF?!?!  You got Darwin running on %s?!?>!?" % arch)
 
     elif os_name == "Windows":
+
         import vtrace.platforms.win32 as v_win32
-        import vtrace.archs.intel as v_intel
-        ilist.append(v_win32.PEMixin)
-        ilist.append(v_intel.IntelMixin)
-        ilist.append(v_win32.Win32Mixin)
+
+        if arch == "i386":
+            return v_win32.Windowsi386Trace()
+
+        elif arch == "amd64":
+            return v_win32.WindowsAmd64Trace()
+
+        else:
+            raise Exception("Windows with arch %s is not supported!" % arch)
 
     else:
+
         raise Exception("ERROR - OS %s not supported yet" % os_name)
-
-    ilist.reverse()
-    ttype = type("Trace", tuple(ilist), {})
-    trace = ttype()
-
-    # Lets let *any* mixin define a initMixin() routine
-    # (mostly for initing modes)
-    for cls in inspect.getmro(trace.__class__):
-        # Skip the first class so it doesn't
-        # fall through to the first inherited one
-        if cls.__name__ == "Trace":
-            continue
-        if hasattr(cls, "initMixin"):
-            cls.initMixin(trace)
-
-    return trace
 
 def interact(pid=0,server=None,trace=None):
 

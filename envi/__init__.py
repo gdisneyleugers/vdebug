@@ -5,22 +5,27 @@ the use of the ArchitectureModule, Opcode, Operand, and
 Emulator objects.
 """
 
-OM_MEMMASK = 0x80
+import struct
+import platform
 
-# Operand Modes
-OM_IMMEDIATE    = 0x1 #  imm
-OM_REGISTER     = 0x2 #  reg
-# Begin "Deref" operands.
-# Any of these may also specify a "disp" displacement
-OM_IMMMEM       = 0x84 #  [ imm + disp]
-OM_REGMEM       = 0x85 #  [ reg + disp ]
-OM_SIBMEM       = 0x86 #  [ reg/imm + indexreg * scale + disp]
+# Instruciton flags (The first 8 bits are reserved for arch independant use)
+IF_NOFALL = 0x01 # Set if this instruction does *not* fall through
+IF_PRIV   = 0x02 # Set if this is a "privileged mode" instruction
+IF_CALL   = 0x04 # Set if this instruction branches to a procedure
+IF_BRANCH = 0x08 # Set if this instruction branches
+IF_RET    = 0x10 # Set if this instruction terminates a procedure
 
-# Instruciton flags
-IF_NOFALL = 1 # Set if this instruction does *not* fall through
-IF_PRIV   = 2 # Set if this is a "privileged mode" instruction
+# Branch flags
+BR_PROC  = 1<<0 # The branch target is a procedure (call <foo>)
+BR_COND  = 1<<1 # The branch target is conditional (jz <foo>)
+BR_DEREF = 1<<2 # the branch target is *dereferenced* into PC (call [0x41414141])
+BR_TABLE = 1<<3 # The branch target is the base of a pointer array of jmp/call slots
+BR_FALL  = 1<<4 # The branch is a "fall through" to the next instruction
 
 import envi.bits as e_bits
+import envi.memory as e_mem
+import envi.registers as e_reg
+import envi.memcanvas as e_canvas
 
 class ArchitectureModule:
     """
@@ -29,61 +34,41 @@ class ArchitectureModule:
     architecture.
     """
     def __init__(self, archname, maxinst=32):
-        self.archname = archname
-        self.maxinst = maxinst # What is the maximum length of an instruction
+        self._arch_name = archname
+        self._arch_maxinst = maxinst
+
+    def archGetBreakInstr(self):
+        """
+        Return a python string of the byte sequence which corresponds to
+        a breakpoint (if present) for this architecture.
+        """
+        raise ArchNotImplemented("archGetBreakInstr")
+
+    def archGetRegCtx(self):
+        """
+        Return an initialized register context object for the architecture.
+        """
+        raise ArchNotImplemented("archGetRegCtx")
 
     def makeOpcode(self, bytes, offset=0):
+        """
+        Create a new opcode from the specified bytes (beginning
+        at the specified offset)
+        """
         raise ArchNotImplemented("makeOpcode")
 
-    def reprOpcode(self, op, va=None, names=None):
-        raise ArchNotImplemented("reprOpcode")
-
-    def reprOperand(self, op, operindex, va=None, names=None):
-        raise ArchNotImplemented("reprOperand")
-
     def getEmulator(self):
+        """
+        Return a default instance of an emulator for the given arch.
+        """
         raise ArchNotImplemented("getEmulator")
 
-    def getRegisterCount(self):
-        """
-        Return the number of registers your architecture will
-        require emulaton for.
-        """
-        raise ArchNotImplemented("getProgramCounterIndex")
-
-    def getProgramCounterIndex(self):
-        raise ArchNotImplemented("getProgramCounterIndex")
-
-    def getStackCounterIndex(self):
-        raise ArchNotImplemented("getStackCounterIndex")
-
-    def getFrameCounterIndex(self):
-        """
-        Return the register index used for the "frame" register
-        (ie ebp on x86).  Or None if there is none on this arch.
-        """
-        raise ArchNotImplemented("getStackCounterIndex")
-
-    def getRegisterName(self, index):
-        raise ArchNotImplemented("getRegisterName")
-
     def getPrefixName(self, prefixes):
+        """
+        Get the name of the prefixes associated with the specified
+        architecture specific prefix bitmask.
+        """
         raise ArchNotImplemented("getPrefixName")
-
-    def spoilsReg(self, opcode, regindex):
-        """
-        Return True of the given instruction changes the value of 
-        of the specified register index.
-        """
-        raise ArchNotImplemented("spoilsReg")
-
-    def getBranches(self, op, va):
-        """
-        Return a list of the possible next program counter values
-        following the opcode (assuming that it lives at
-        the specified virtual address).
-        """
-        raise ArchNotImplemented()
 
     def getPointerSize(self):
         """
@@ -91,6 +76,16 @@ class ArchitectureModule:
         """
         raise ArchNotImplemented("getPointerSize")
 
+    def pointerString(self, va):
+        """
+        Return a string representation for a pointer on this arch
+        """
+        raise ArchNotImplemented("pointerString")
+
+################################################################
+#
+# FIXME going away and becomming part of opcode.
+#
     def getStackDelta(self, op):
         """
         If the given opcode instruction changes the value of the
@@ -98,33 +93,9 @@ class ArchitectureModule:
         """
         raise ArchNotImplemented("getStackDelta")
 
-    def isCall(self, opcode):
-        """
-        Return True if the given opcode object is a "call" type
-        branching instruction
-        """
-        raise ArchNotImplemented("isCall")
-
-    def isBranch(self, opcode):
-        """
-        Return True if the given opcode object is a branching instruction
-        """
-        raise ArchNotImplemented("isBranch")
-
-    def isReturn(self, opcode):
-        """
-        Return True if the given opcode object triggers a procedure exit.
-        """
-        raise ArchNotImplemented("isReturn")
-
-    def pointerString(self, va):
-        """
-        Return a string representation for a pointer on this arch
-        """
-        raise ArchNotImplemented("pointerString")
-
 class EnviException(Exception):
-    pass
+    def __str__(self):
+        return repr(self)
 
 class InvalidInstruction(EnviException):
     """
@@ -158,7 +129,10 @@ class EmuException(EnviException):
     """
     def __init__(self, emu, msg=None):
         EnviException.__init__(self, msg)
-        self.va = emu.getRegister(emu.pcindex)
+        self.va = emu.getProgramCounter()
+
+    def __repr__(self):
+        return "%s at %s" % (self.__class__.__name__, hex(self.va))
 
 class UnsupportedInstruction(EmuException):
     """
@@ -168,8 +142,9 @@ class UnsupportedInstruction(EmuException):
     def __init__(self, emu, op):
         EmuException.__init__(self, emu)
         self.op = op
+
     def __repr__(self):
-        return "Unsupported Instruction: %s" % repr(self.op)
+        return "Unsupported Instruction: 0x%.8x %s" % (self.va, repr(self.op))
 
 class DivideByZero(EmuException):
     """
@@ -201,83 +176,101 @@ class UnknownCallingConvention(EmuException):
     are given an unknown calling convention type.
     """
 
+class MapOverlapException(EnviException):
+    """
+    Raised when adding a memory map to a MemoryObject which overlaps
+    with another already existing map.
+    """
+    def __init__(self, map1, map2):
+        self.map1 = map1
+        self.map2 = map2
+        margs = (map1[0], map1[1], map2[0], map2[1])
+        EnviException.__init__(self, "Map At 0x%.8x (%d) overlaps map at 0x%.8x (%d)" % margs)
+
 class Operand:
-    def __init__(self, mode, tsize, reg=None, indexreg=None, imm=None, disp=None, scale=None):
-        self.tsize = tsize
-        self.mode = mode
-        self.reg = reg
-        self.indexreg = indexreg
-        self.imm = imm
-        self.disp = disp
-        self.scale = scale
+
+    """
+    Thses are the expected methods needed by any implemented operand object
+    attached to an envi Opcode.  This does *not* have a constructor of it's
+    pwn on purpose to cut down on memory use and constructor CPU cost.
+    """
+
+    def getOperValue(self, op, emu=None):
+        """
+        Get the current value for the operand.  If needed, use
+        the given emulator/workspace/trace to resolve things like
+        memory and registers.
+
+        NOTE: This API may be passed a None emu and should return what it can
+              (or None if it can't be resolved)
+        """
+        raise Exception("%s needs to implement getOperValue!" % self.__class__.__name__)
+
+    def setOperValue(self, op, emu, val):
+        """
+        Set the current value for the operand.  If needed, use
+        the given emulator/workspace/trace to assign things like
+        memory and registers.
+        """
+        raise Exception("%s needs to implement setOperValue! (0x%.8x: %s) " % (self.__class__.__name__, op.va, repr(op)))
+
+    def isDeref(self):
+        """
+        If the given operand will dereference memory, this method must return True.
+        """
+        return False
+
+    def getOperAddr(self, op, emu):
+        """
+        If the operand is a "dereference" operand, this method should use the
+        specified op/emu to resolve the address of the dereference.
+
+        NOTE: This API may be passed a None emu and should return what it can
+              (or None if it can't be resolved)
+        """
+        raise Exception("%s needs to implement getOperAddr!" % self.__class__.__name__)
+
+    
+    def repr(self, op):
+        """
+        Used by the Opcode class to get a humon readable string for this operand.
+        """
+        return "unknown"
+
+    def render(self, mcanv, op, idx):
+        """
+        Used by the opcode class when rendering to a memory canvas.
+        """
+        mcanv.addText(self.repr(op))
 
     def __ne__(self, op):
         return not op == self
 
     def __eq__(self, oper):
-        if not isinstance(oper, Operand):
+        if not isinstance(oper, self.__class__):
             return False
-        if self.mode != oper.mode:
-            return False
-        if self.tsize != oper.tsize:
-            return False
-        if self.reg != oper.reg:
-            return False
-        if self.indexreg != oper.indexreg:
-            return False
-        if self.imm != oper.imm:
-            return False
-        if self.disp != oper.disp:
-            return False
-        if self.scale != oper.scale:
-            return False
+        #FIXME each one will need this...
         return True
-
-    def __repr__(self):
-
-        if self.mode == OM_IMMEDIATE:
-            return hex(self.imm)
-
-        elif self.mode == OM_REGISTER:
-            return "reg%d" % self.reg
-
-        elif self.mode == OM_IMMMEM:
-            return "[0x%.8x]" % self.imm
-
-        elif self.mode == OM_REGMEM:
-            if self.disp != None:
-                return "[reg%d + %d]" % (self.reg, self.disp)
-            else:
-                return "[reg%d]" % self.reg
-
-        elif self.mode == OM_SIBMEM:
-            s = ""
-            if self.imm != None:
-                s += "0x%.8x " % self.imm
-            if self.reg != None:
-                s += "reg%d " % self.reg
-            if self.indexreg != None:
-                s += "+ reg%d " % self.indexreg
-                if self.scale != None:
-                    s += "* %d " % self.scale
-            if self.disp != None:
-                s += "+ %d" % self.disp
-            return "[%s]" % s
 
 class Opcode:
     """
     A universal representation for an opcode
     """
-    def __init__(self, opcode, mnem, prefixes, size, operands, iflags=0):
+    def __init__(self, va, opcode, mnem, prefixes, size, operands, iflags=0):
         """
         constructor for the basic Envi Opcode object.  Arguments as follows:
 
-        opcode - An architecture specific numerical value for the opcode
-        mnem   - A humon readable mnemonic for the opcode
+        opcode   - An architecture specific numerical value for the opcode
+        mnem     - A humon readable mnemonic for the opcode
         prefixes - a bitmask of architecture specific instruction prefixes
-        size - The size of the opcode in bytes
+        size     - The size of the opcode in bytes
         operands - A list of Operand objects for this opcode
-        iflags -   A list of Envi (architecture independant) instruction flags (see IF_FOO)
+        iflags   - A list of Envi (architecture independant) instruction flags (see IF_FOO)
+        va       - The virtual address the instruction lives at (used for PC relative immediates etc...)
+
+        NOTE: If you want to create an architecture spcific opcode, I'd *highly* recommend you
+              just copy/paste in the following simple initial code rather than calling the parent
+              constructor.  The extra
         """
         self.opcode = opcode
         self.mnem = mnem
@@ -286,22 +279,7 @@ class Opcode:
         self.opers = operands
         self.repr = None
         self.iflags = iflags
-
-    def copy(self):
-        """
-        Create a copy of this opcode object with as little object instantiation
-        as possible.
-        """
-        opers = []
-        for o in self.opers:
-            opers.append(Operand(o.mode, o.tsize, o.reg, o.indexreg, o.imm, o.disp))
-        return Opcode(self.opcode, self.mnem, self.prefixes, self.size, opers, self.iflags)
-
-    def makeRepr(self):
-        x = [self.mnem,]
-        for o in self.opers:
-            x.append(repr(o))
-        return " ".join(x)
+        self.va = va
 
     def __ne__(self, op):
         return not op == self
@@ -328,19 +306,40 @@ class Opcode:
         return int(hash(self.mnem) ^ (self.size << 4))
 
     def __repr__(self):
-        if self.repr == None:
-            self.repr = self.makeRepr()
-        return self.repr
+        """
+        Over-ride this if you want to make arch specific repr.
+        """
+        return self.mnem + " " + ",".join([o.repr(self) for o in self.opers])
 
     def __len__(self):
         return int(self.size)
 
-class Emulator:
+
+    # NOTE: From here down is mostly things that architecture specific opcode
+    #       extensions should override.
+    def getBranches(self, emu=None):
+        """
+        Return a list of tuples.  Each tuple contains the target VA of the
+        branch, and a possible set of flags showing what type of branch it is.
+
+        See the BR_FOO types for all the supported envi branch flags....
+        Example: for bva,bflags in op.getBranches():
+        """
+        return ()
+
+    def render(self, mcanv):
+        """
+        Render this opcode to the memory canvas passed in.  This is used for both
+        simple printing AND more complex representations.
+        """
+        mcanv.addText("%s HAS NO RENDER METHOD" % self.__class__.__name__)
+
+class Emulator(e_reg.RegisterContext, e_mem.IMemory):
     """
     The Emulator class is mostly "Abstract" in the java
     Interface sense.  The emulator should be able to
     be extended for the architecutures which are included
-    in the envi framework.  You *must* give the constructor
+    in the envi framework.  You *must* mix in
     an instance of your architecture abstraction module.
 
     (NOTE: Most users will just use an arch mod and call getEmulator())
@@ -355,23 +354,14 @@ class Emulator:
     to manage execution flow and determine whatever is possible from the 
     PDE process that reversers typically do in their heads.
     """
-    def __init__(self, archmod, regarray=None, segs=None, memobj=None):
-        self.arch = archmod
-        self.pcindex = archmod.getProgramCounterIndex()
-        self.spindex = archmod.getStackCounterIndex()
-        self.rcount  = archmod.getRegisterCount()
-        if regarray == None:
-            regarray = []
-            for i in range(self.rcount):
-                regarray.append(0)
+    def __init__(self, segs=None, memobj=None):
+        e_mem.IMemory.__init__(self)
+        e_reg.RegisterContext.__init__(self)
 
         if segs == None:
             segs = [(0,0xffffffff),]
 
         self.segments = segs
-
-        # Set up some regs and masks
-        self.regs = regarray
 
         # Save off the memory object
         self.setMemoryObject(memobj)
@@ -388,17 +378,20 @@ class Emulator:
             if name.startswith("i_"):
                 self.op_methods[name[2:]] = getattr(self, name)
 
-    def setStackCounter(self, value):
-        return self.setRegister(self.spindex, value)
+    def emuSnapshot(self):
+        """
+        Return the data needed to "snapshot" this emulator.  For most
+        archs, this method will be enough (it takes the memory object,
+        and register values with it)
+        """
+        regs = self.getRegisterSnap()
+        mem  = copy.deepcopy(self.memobj)
+        return regs,mem
 
-    def getStackCounter(self):
-        return self.getRegister(self.spindex)
-
-    def setProgramCounter(self, value):
-        return self.setRegister(self.pcindex, value)
-
-    def getProgramCounter(self):
-        return self.getRegister(self.pcindex)
+    def emuRestore(self, snap):
+        regs,mem = snap
+        self.setRegisterSnap(regs)
+        self.setMemoryObject(mem)
 
     def getSegmentInfo(self, op):
         idx = self.getSegmentIndex(op)
@@ -431,31 +424,6 @@ class Emulator:
         """
         raise ArchNotImplemented()
 
-    def getRegister(self, regindex):
-        """
-        Given the architecture specific register index,
-        return the current value.
-        """
-        return self.regs[regindex]
-
-    def setRegister(self, regindex, value):
-        """
-        Set the value of the architecuture specific register
-        by index.
-        """
-        # We assume a default "pointer length" width.  If you are
-        # dealing with registers other than that, you will need
-        # to over-ride this method to use them (see IntelModule for example)
-        width = self.arch.getPointerSize()
-        value = e_bits.unsigned(value, width)
-        self.regs[regindex] = value
-
-    def makeOpcode(self, pc):
-        """
-        This is the core method for the 
-        """
-        raise ArchNotImplemented()
-
     def run(self, stepcount=None):
         """
         Run the emulator until "something" happens.
@@ -470,9 +438,15 @@ class Emulator:
 
     def stepi(self):
         pc = self.getProgramCounter()
-        op = self.makeOpcode(pc)
+        bytes = self.readMemory(pc, 32)
+        op = self.makeOpcode(bytes)
         self.executeOpcode(op)
 
+#############################################################
+#
+# NOTE: Although we are an IMemory object, our primitive
+# reads/writes/maps go to another...
+#
     def readMemory(self, va, size):
         """
         Read memory bytes in the emulated environment.
@@ -487,6 +461,10 @@ class Emulator:
         """
         return self.memobj.writeMemory(va, bytes)
 
+    def getMemoryMaps(self):
+        return self.memobj.getMemoryMaps()
+#############################################################
+
     def getOperValue(self, op, idx):
         """
         Return the value for the operand at index idx for
@@ -495,67 +473,15 @@ class Emulator:
         In partially-defined emulation, this may return None
         """
         oper = op.opers[idx]
-        if oper.mode == OM_IMMEDIATE:
-            return oper.imm
+        return oper.getOperValue(op, self)
 
-        if oper.mode == OM_REGISTER:
-            return self.getRegister(oper.reg)
-
-        val = self.getOperAddress(op, idx)
-        return self.readMemValue(val, oper.tsize)
-
-    def getOperAddress(self, op, idx):
+    def getOperAddr(self, op, idx):
         """
         Return the address that an operand which deref's memory
         would read from on getOperValue().
         """
-
         oper = op.opers[idx]
-
-        if oper.mode == OM_IMMMEM:
-            base,size = self.getSegmentInfo(op)
-            return e_bits.unsigned(base + oper.imm, oper.tsize)
-
-        if oper.mode == OM_REGMEM:
-
-            val = self.getRegister(oper.reg)
-            if val == None:
-                return None
-
-            base,size = self.getSegmentInfo(op)
-            val += base
-
-            if oper.disp != None:
-                val += oper.disp
-
-            return e_bits.unsigned(val, oper.tsize)
-
-        if oper.mode == OM_SIBMEM:
-            addr = 0
-            if oper.reg != None:
-                basereg = self.getRegister(oper.reg)
-                if basereg == None:
-                    return None
-                addr += basereg
-
-            if oper.imm != None:
-                addr += oper.imm
-
-            if oper.indexreg != None:
-                index = self.getRegister(oper.indexreg)
-                if index == None:
-                    return None
-                if oper.scale != None:
-                    index *= oper.scale
-                addr += index
-
-            if oper.disp != None:
-                addr += oper.disp
-
-            base,size = self.getSegmentInfo(op)
-            return e_bits.unsigned(addr + base, oper.tsize)
-
-        raise Exception("getOperAddress() on wrong type!")
+        return oper.getOperAddr(op, self)
 
     def setOperValue(self, op, idx, value):
         """
@@ -564,49 +490,7 @@ class Emulator:
         (obviously OM_IMMEDIATE *cannot* be set)
         """
         oper = op.opers[idx]
-
-        value = e_bits.unsigned(value, oper.tsize)
-
-        if oper.mode == OM_IMMEDIATE:
-            raise InvalidInstruction()
-
-        if oper.mode == OM_REGISTER:
-            return self.setRegister(oper.reg, value)
-
-        if oper.mode == OM_IMMMEM:
-            base,size = self.getSegmentInfo(op)
-            return self.writeMemValue(base + oper.imm, value, oper.tsize)
-
-        if oper.mode == OM_REGMEM:
-            reg = self.getRegister(oper.reg)
-
-            base,size = self.getSegmentInfo(op)
-            reg += base
-
-            if oper.disp != None:
-                reg += oper.disp
-            return self.writeMemValue(reg, value, oper.tsize)
-
-        if oper.mode == OM_SIBMEM:
-            base,size = self.getSegmentInfo(op)
-            addr = base
-
-            if oper.reg != None:
-                addr += self.getRegister(oper.reg)
-
-            if oper.imm != None:
-                addr += oper.imm
-
-            if oper.indexreg != None:
-                index = self.getRegister(oper.indexreg)
-                if oper.scale != None:
-                    index *= oper.scale
-                addr += index
-
-            if oper.disp != None:
-                addr += oper.disp
-
-            return self.writeMemValue(addr, value, oper.tsize)
+        return oper.setOperValue(op, self, value)
 
     def addCallingConvention(self, name, obj):
         self.call_convs[name] = obj
@@ -630,7 +514,7 @@ class Emulator:
 
         return c.getCallArgs(self, count)
 
-    def setReturnValue(self, value, cc, ccinfo=None):
+    def setReturnValue(self, value, cc, argc=0):
         """
         Emulator implementors can implement this method to allow
         analysis modules a platform/architecture independant way
@@ -642,7 +526,7 @@ class Emulator:
         if c == None:
             raise UnknownCallingConvention(cc)
 
-        return c.setReturnValue(self, value, ccinfo)
+        return c.setReturnValue(self, value, argc)
 
 class CallingConvention:
     """
@@ -654,90 +538,45 @@ class CallingConvention:
     def getCallArgs(self, emu, count):
         pass
 
-class MemoryObject:
-    def __init__(self, maps=None, pagesize=4096):
-        """
-        Take a set of memory maps (va, perms, bytes) and put them in
-        a sparse space finder. You may specify your own page-size to optimize
-        the search for an architecture.
-        """
-        self.pagesize = pagesize
-        self.mask = (0-pagesize) & 0xffffffff
-        self.maplookup = {}
-        if maps != None:
-            for va,perms,bytes in maps:
-                self.addMemoryMap(va, perms, bytes)
+# NOTE: This mapping is needed because of inconsistancies
+# in how different compilers and versions of python embed
+# the machine setting.
+arch_xlate_32 = {
+    'i386':'i386',
+    'i486':'i386',
+    'i586':'i386',
+    'i686':'i386',
+    'x86':'i386',
+    'i86pc':'i386', # Solaris
+    '':'i386', # Stupid windows...
+}
 
-    def addMemoryMap(self, va, perms, bytes):
-        x = [va, perms, bytes] # Asign to a list cause we need to write to it
-        base = va & self.mask
-        maxva = va + len(bytes)
-        while base < maxva:
-            self.maplookup[base] = x
-            base += self.pagesize
+arch_xlate_64 = {
+    'x86_64':'amd64',
+    'AMD64':'amd64',
+    'amd64':'amd64',
+    '':'amd64', # And again....
+}
 
-    def getMemoryMap(self, va):
-        """
-        Get the va,perms,bytes list for this map
-        """
-        return self.maplookup.get(va & self.mask)
-
-    #FIXME make extendable maps for things like the stack
-    def checkMemory(self, va, perms=0):
-        map = self.maplookup.get(va & self.mask)
-        if map == None:
-            return False
-        if (perms & map[1]) != perms:
-            return False
-        return True
-
-    def readMemory(self, va, size):
-        map = self.maplookup.get(va & self.mask)
-        if map == None:
-            raise SegmentationViolation(va)
-        if not map[1] & 4: #FIXME make permission bits
-            raise SegmentationViolation(va)
-        offset = va - map[0]
-        return map[2][offset:offset+size]
-
-    def writeMemory(self, va, bytes):
-        map = self.maplookup.get(va & self.mask)
-        if map == None:
-            raise SegmentationViolation(va)
-        if not map[1] & 2: #FIXME make permission bits
-            raise SegmentationViolation(va)
-        offset = va - map[0]
-        map[2] = map[2][:offset] + bytes + map[2][offset+len(bytes):]
-
-class MemoryTracker:
+def getCurrentArch():
     """
-    A utility that will track memory access and let everything be valid
-    memory for reading and writing.
+    Return an envi normalized name for the current arch.
     """
-    def __init__(self):
-        self.bytes = {}
-        self.reads = []
-        self.writes = []
+    width = struct.calcsize("P")
+    mach = platform.machine()   # 'i386','ppc', etc...
 
-    def readMemory(self, va, size):
-        #FIXME make this unique so it can be tracked
-        #FIXME make this return anything he's written already
-        self.reads.append((va, size))
-        return "A"*size
+    if width == 4:
+        ret = arch_xlate_32.get(mach)
 
-    def writeMemory(self, va, bytes):
-        self.writes.append((va, bytes))
-        self.bytes[va] = bytes
-        
-class FakeMemory:
-    def checkMemory(self, va, perms=0):
-        return True
-    def readMemory(self, va, size):
-        return "A"*size
-    def writeMemory(self, va, bytes):
-        pass
+    elif width == 8:
+        ret = arch_xlate_64.get(mach)
 
-def getArchModule(name):
+    if ret == None:
+        raise ArchNotImplemented(mach)
+
+    return ret
+
+def getArchModule(name=None):
     """
     return an Envi architecture module instance for the following
     architecture name.
@@ -745,10 +584,20 @@ def getArchModule(name):
     Current architectures include:
 
     i386 - Intel i386
+    amd64 - The new 64bit AMD spec.
     """
-    if name in ["i386","i486","i586","i686"]:
-        import envi.intel as e_intel
-        return e_intel.IntelModule()
+    if name == None:
+        name = getCurrentArch()
+
+    # Some builds have x86 (py2.6) and some have other stuff...
+    if name in ["i386","i486","i586","i686","x86"]:
+        import envi.archs.i386 as e_i386
+        return e_i386.i386Module()
+
+    elif name == "amd64":
+        import envi.archs.amd64 as e_amd64
+        return e_amd64.Amd64Module()
+
     else:
         raise ArchNotImplemented(name)
 

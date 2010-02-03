@@ -8,9 +8,10 @@ import gtk
 import cobra
 import cobra.cluster as c_cluster
 
-import vwidget.main as vw_main
 import vwidget.util as vw_util
 import vwidget.views as vw_views
+
+from vwidget.main import idlethread
 
 class ClusterServerView(vw_views.VTreeView,
                         c_cluster.ClusterCallback):
@@ -24,8 +25,8 @@ class ClusterServerView(vw_views.VTreeView,
         ("Percent",3,int)
     )
 
-    def __init__(self, layout):
-        vw_views.VTreeView.__init__(self, layout)
+    def __init__(self):
+        vw_views.VTreeView.__init__(self)
         # Hook all the GUI callbacks in the server.
         #FIXME make this a callback object in the server
         self.id_iter = {}
@@ -36,39 +37,36 @@ class ClusterServerView(vw_views.VTreeView,
 
     # Mirror the server interfaces so it's easy to keep things straight
     def workGotten(self, server, work):
-        vw_main.guilock.acquire()
-        try:
-            ip,port = cobra.getCallerInfo()
-            #FIXME reverse lookup?
+        ip,port = cobra.getCallerInfo()
+        self._dispWorkGotten(work, ip, port)
+
+    @idlethread
+    def _dispWorkGotten(self, work, ip, port):
             iter = self.model.append((work.id, ip, "Starting", 0))
             self.id_iter[work.id] = iter
-        finally:
-            vw_main.guilock.release()
 
+    @idlethread
     def workDone(self, server, work):
-        vw_main.guilock.acquire()
-        try:
-            iter = self.id_iter.pop(work.id)
+        iter = self.id_iter.pop(work.id, None)
+        if iter != None:
             self.vwRemove(iter)
-        finally:
-            vw_main.guilock.release()
 
     def workTimeout(self, server, work):
         self.workDone(server, work)
 
-    def workStatus(self, server, workid, status):
-        vw_main.guilock.acquire()
-        try:
-            iter = self.id_iter.get(workid)
-            self.model.set_value(iter, 2, status)
-        finally:
-            vw_main.guilock.release()
+    def workCanceled(self, server, work):
+        self.workDone(server, work)
 
+    def workFailed(self, server, work):
+        self.workDone(server, work)
+
+    @idlethread
+    def workStatus(self, server, workid, status):
+        iter = self.id_iter.get(workid)
+        self.model.set_value(iter, 2, status)
+
+    @idlethread
     def workCompletion(self, server, workid, percent):
-        vw_main.guilock.acquire()
-        try:
-            iter = self.id_iter.get(workid)
-            self.model.set_value(iter, 3, percent)
-        finally:
-            vw_main.guilock.release()
+        iter = self.id_iter.get(workid)
+        self.model.set_value(iter, 3, percent)
 

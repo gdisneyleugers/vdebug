@@ -1,6 +1,106 @@
+
 import gtk
 import gtk.glade
 
+import envi.cli as e_cli
+
+import vwidget.layout as vw_layout
+import vwidget.menubuilder as vw_menu
+import vwidget.memview as vw_memview
+
+from envi.threads import firethread
+from vwidget.main import idlethread
+
+class MainWindow(vw_layout.LayoutWindow):
+    """
+    A nice main text window with a CLI input and history etc...
+    """
+    def __init__(self, cli, memobj, syms=None):
+        vw_layout.LayoutWindow.__init__(self)
+        self.cli = cli
+        self.connect("key-press-event", self.keypressed)
+
+        self.vbox = gtk.VBox()
+        self.menubar = vw_menu.MenuBar()
+
+        self.add(self.vbox)
+        self.vbox.pack_start(self.menubar, expand=False)
+        toolbar = self.getMainToolbar()
+        if toolbar != None:
+            self.vbox.pack_start(toolbar, expand=False)
+
+        self.canvas = vw_memview.ScrolledMemoryView(memobj, syms=syms)
+        self.canvas.textview.set_property("wrap_mode", gtk.WRAP_WORD)
+        self.vbox.pack_start(self.canvas, expand=True)
+
+        # If it's an EnviCli, let's over-ride the canvas right away.
+        if isinstance(cli, e_cli.EnviCli):
+            cli.setCanvas(self.canvas)
+
+        entry = gtk.Entry()
+        entry.connect("activate", self.cli_activate)
+        entry.connect("key-press-event", self.entrykeypressed)
+        self.vbox.pack_start(entry, expand=False)
+
+        self.history = []
+        self.histidx = 0
+        entry.grab_focus()
+
+    def getMainToolbar(self):
+        return None
+
+    def useHistory(self, entry, delta):
+        if delta < 0 and self.histidx == 0:
+            return
+
+        if delta > 0 and len(self.history) <= self.histidx+delta:
+            self.histidx = len(self.history)
+            entry.set_text("")
+            return
+
+        self.histidx += delta
+        htext = self.history[self.histidx]
+        entry.set_text(htext)
+        entry.set_position(-1)
+
+    def entrykeypressed(self, entry, event):
+        if event.keyval == 65362:
+            self.useHistory(entry, -1)
+            return True
+        elif event.keyval == 65364:
+            self.useHistory(entry, 1)
+            return True
+        return False
+
+    def onecmd(self, cmd):
+        '''
+        Issue a single command with proper history tracking etc...
+        (fires a thread to do it...)
+        '''
+        cmd = self.cli.precmd(cmd)
+        self.canvas.write("%s %s\n" % (self.cli.prompt,cmd))
+        self.cli.onecmd(cmd)
+        self.addHistory(cmd)
+
+    def keypressed(self, window, event):
+        fkbase = 65469
+        fkey = event.keyval - fkbase
+        if fkey >= 1 and fkey < 13:
+            self.onecmd("<f%d>" % fkey)
+
+        elif event.keyval == 65299:
+            self.onecmd("break")
+
+    def addHistory(self, histcmd):
+        self.history.append(histcmd)
+        self.histidx = len(self.history)
+
+    def cli_activate(self, entry):
+        cmd = entry.get_text()
+        entry.set_text("")
+        self.onecmd(cmd)
+
+#FIXME is anything even using this one still?
 class VWindow:
     """
     A class for all vdb/vivisect windows to inherit from.  Full of

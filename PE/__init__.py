@@ -1,8 +1,11 @@
 
-#FIXME remember to do dos2unix
 import struct
 import vstruct
-import vstruct.pe as vs_pe
+import vstruct.defs.pe as vs_pe
+
+IMAGE_FILE_MACHINE_I386  = 0x014c
+IMAGE_FILE_MACHINE_IA64  = 0x0200
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
 
 IMAGE_DIRECTORY_ENTRY_EXPORT          =0   # Export Directory
 IMAGE_DIRECTORY_ENTRY_IMPORT          =1   # Import Directory
@@ -70,6 +73,9 @@ IMAGE_SCN_MEM_EXECUTE               = 0x20000000
 IMAGE_SCN_MEM_READ                  = 0x40000000
 IMAGE_SCN_MEM_WRITE                 = 0x80000000
 
+# FIXME TODO HACK XXX
+# * Save PE back out to file
+
 class PE(object):
     def __init__(self, fd, inmem=False):
         """
@@ -80,22 +86,42 @@ class PE(object):
         self.inmem = inmem
         self.fd = fd
         self.fd.seek(0)
+        self.pe32p = False
+        self.psize = 4
 
-        dosbytes = fd.read(vstruct.calcsize(vs_pe.IMAGE_DOS_HEADER))
-        self.IMAGE_DOS_HEADER = vs_pe.IMAGE_DOS_HEADER(dosbytes)
+        self.IMAGE_DOS_HEADER = vstruct.getStructure("pe.IMAGE_DOS_HEADER")
+        dosbytes = fd.read(len(self.IMAGE_DOS_HEADER))
+        self.IMAGE_DOS_HEADER.vsParse(dosbytes)
 
-        fd.seek(int(self.IMAGE_DOS_HEADER.e_lfanew))
-        ntbytes = fd.read(vstruct.calcsize(vs_pe.IMAGE_NT_HEADERS))
-        #FIXME if code offset != sizeof nt headers, maybe old PE... handle them too
-        self.IMAGE_NT_HEADERS = vs_pe.IMAGE_NT_HEADERS(ntbytes)
+        nt = self.readStructAtOffset(self.IMAGE_DOS_HEADER.e_lfanew,
+                                "pe.IMAGE_NT_HEADERS")
 
-        if int(self.IMAGE_NT_HEADERS.FileHeader.SizeOfOptionalHeader) != 224:
-            print "ERROR: SizeOfOptionalHeader != 224"
+        # Parse in a default 32 bit, and then check for 64...
+        if nt.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64:
+            nt = self.readStructAtOffset(self.IMAGE_DOS_HEADER.e_lfanew,
+                                "pe.IMAGE_NT_HEADERS64")
+            self.pe32p = True
+            self.psize = 8
+
+        self.IMAGE_NT_HEADERS = nt
+
+    def getPdataEntries(self):
+        sec = self.getSectionByName('.pdata')
+        if sec == None:
+            return ()
+        ret = []
+        bytes = self.readAtRva(sec.VirtualAddress, sec.VirtualSize)
+        while len(bytes):
+            f = vs_pe.IMAGE_RUNTIME_FUNCTION_ENTRY()
+            f.vsParse(bytes)
+            bytes = bytes[len(f):]
+            ret.append(f)
+        return ret
 
     def getDllName(self):
         if self.IMAGE_EXPORT_DIRECTORY != None:
-            ordoff = self.rvaToOffset(int(self.IMAGE_EXPORT_DIRECTORY.AddressOfOrdinals))
-            ordsize = 2 * int(self.IMAGE_EXPORT_DIRECTORY.NumberOfNames)
+            ordoff = self.rvaToOffset(self.IMAGE_EXPORT_DIRECTORY.AddressOfOrdinals)
+            ordsize = 2 * self.IMAGE_EXPORT_DIRECTORY.NumberOfNames
             return self.readAtOffset(ordoff + ordsize, 32).split("\x00", 1)[0]
         return None
 
@@ -128,15 +154,15 @@ class PE(object):
             return rva
 
         for s in self.sections:
-            sbase = int(s.VirtualAddress)
-            ssize = int(s.VirtualSize)
+            sbase = s.VirtualAddress
+            ssize = s.VirtualSize
             if rva >= sbase and rva < (sbase + ssize):
-                return int(s.PointerToRawData) + (rva - sbase)
+                return s.PointerToRawData + (rva - sbase)
         return 0
 
     def getSectionByName(self, name):
         for s in self.getSections():
-            if s.Name.value.split("\x00", 1)[0] == name:
+            if s.Name.split("\x00", 1)[0] == name:
                 return s
         return None
 
@@ -145,6 +171,20 @@ class PE(object):
 
     def getNamedResources(self):
         return self.name_resources
+
+    def readStructAtRva(self, rva, structname):
+        s = vstruct.getStructure(structname)
+        bytes = self.readAtRva(rva, len(s))
+        #print "%s: %s" % (structname, bytes.encode('hex'))
+        s.vsParse(bytes)
+        return s
+
+    def readStructAtOffset(self, offset, structname):
+        s = vstruct.getStructure(structname)
+        bytes = self.readAtOffset(offset, len(s))
+        #print "%s: %s" % (structname, bytes.encode('hex'))
+        s.vsParse(bytes)
+        return s
 
     def parseResources(self):
         self.id_resources = []
@@ -155,15 +195,15 @@ class PE(object):
         if sec == None:
             return 
 
-        irdsize = vstruct.calcsize(vs_pe.IMAGE_RESOURCE_DIRECTORY)
-        irdbytes = self.readAtRva(int(sec.VirtualAddress), irdsize)
-        self.IMAGE_RESOURCE_DIRECTORY = vs_pe.IMAGE_RESOURCE_DIRECTORY(irdbytes)
+        self.IMAGE_RESOURCE_DIRECTORY = self.readStructAtRva(
+                                            sec.VirtualAddress,
+                                            "pe.IMAGE_RESOURCE_DIRECTORY")
 
-        namecount = int(self.IMAGE_RESOURCE_DIRECTORY.NumberOfNamedEntries)
-        idcount = int(self.IMAGE_RESOURCE_DIRECTORY.NumberOfIdEntries)
+        namecount = self.IMAGE_RESOURCE_DIRECTORY.NumberOfNamedEntries
+        idcount = self.IMAGE_RESOURCE_DIRECTORY.NumberOfIdEntries
         entsize = 8
 
-        rsrcbase = int(sec.VirtualAddress)
+        rsrcbase = sec.VirtualAddress
 
         namebytes = self.readAtRva(rsrcbase + irdsize, namecount * entsize)
         idbytes = self.readAtRva(rsrcbase + irdsize + (namecount*entsize), idcount * entsize)
@@ -182,12 +222,15 @@ class PE(object):
 
     def parseSections(self):
         self.sections = []
-        off = int(self.IMAGE_DOS_HEADER.e_lfanew) + vstruct.calcsize(vs_pe.IMAGE_NT_HEADERS)
-        secsize = vstruct.calcsize(vs_pe.IMAGE_SECTION_HEADER)
+        off = self.IMAGE_DOS_HEADER.e_lfanew + len(self.IMAGE_NT_HEADERS)
 
-        sbytes = self.readAtOffset(off, secsize * int(self.IMAGE_NT_HEADERS.FileHeader.NumberOfSections))
+        secsize = len(vstruct.getStructure("pe.IMAGE_SECTION_HEADER"))
+
+        sbytes = self.readAtOffset(off, secsize * self.IMAGE_NT_HEADERS.FileHeader.NumberOfSections)
         while sbytes:
-            self.sections.append(vs_pe.IMAGE_SECTION_HEADER(sbytes[:secsize]))
+            s = vstruct.getStructure("pe.IMAGE_SECTION_HEADER")
+            s.vsParse(sbytes[:secsize])
+            self.sections.append(s)
             sbytes = sbytes[secsize:]
 
     def readRvaFormat(self, fmt, rva):
@@ -204,51 +247,66 @@ class PE(object):
         ret = ""
         self.fd.seek(offset)
         while len(ret) != size:
-            x = self.fd.read(size - len(ret))
+            rlen = size - len(ret)
+            x = self.fd.read(rlen)
             if x == "":
                 raise Exception("EOF In readAtOffset()")
             ret += x
         return ret
 
+    def parseLoadConfig(self):
+        self.IMAGE_LOAD_CONFIG = None
+        cdir = self.IMAGE_NT_HEADERS.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG]
+        rva = cdir.VirtualAddress
+        if rva != 0:
+            self.IMAGE_LOAD_CONFIG = self.readStructAtRva(rva, "pe.IMAGE_LOAD_CONFIG_DIRECTORY")
+
+    def readPointerAtOffset(self, off):
+        fmt = "<L"
+        if self.psize == 8:
+            fmt = "<Q"
+        return struct.unpack(fmt, self.readAtOffset(off, self.psize))[0]
+        
     def parseImports(self):
         self.imports = []
-        self.IMAGE_IMPORT_DIRECTORY = None
 
         idir = self.IMAGE_NT_HEADERS.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
-        poff = self.rvaToOffset(int(idir.VirtualAddress))
+        poff = self.rvaToOffset(idir.VirtualAddress)
 
         if poff == 0:
             return
 
-        isize = vstruct.calcsize(vs_pe.IMAGE_IMPORT_DIRECTORY)
-        ibytes = self.readAtOffset(poff, isize)
-        x = vs_pe.IMAGE_IMPORT_DIRECTORY(ibytes)
-        while int(x.Name) != 0:
+        x = vstruct.getStructure("pe.IMAGE_IMPORT_DIRECTORY")
+        isize = len(x)
+        x.vsParse(self.readAtOffset(poff, isize))
+        while x.Name != 0:
 
-            liboff = self.rvaToOffset(int(x.Name))
+            liboff = self.rvaToOffset(x.Name)
             libname = self.readAtOffset(liboff, 256).split("\x00")[0]
 
-            ord = 0
-            noff = self.rvaToOffset(int(x.OriginalFirstThunk))
-            aoff = self.rvaToOffset(int(x.FirstThunk))
+            idx = 0
+            noff = self.rvaToOffset(x.OriginalFirstThunk)
+            aoff = self.rvaToOffset(x.FirstThunk)
 
             while True:
-                ava = struct.unpack("<L", self.readAtOffset(aoff+(4*ord), 4))[0]
+                ava = self.readPointerAtOffset(aoff+(self.psize*idx))
                 if ava == 0:
                     break
 
-                nva = struct.unpack("<L", self.readAtOffset(noff+(4*ord), 4))[0]
+                nva = self.readPointerAtOffset(noff+(self.psize*idx))
+                #FIXME high bit testing for 64 bit
+                if nva & 0x80000000:
+                    name = "ord%d" % (nva & 0x7fffffff,)
+                else:
+                    nameoff = self.rvaToOffset(nva) + 2 # Skip the short "hint"
+                    name = self.readAtOffset(nameoff, 256).split("\x00")[0]
 
-                nameoff = self.rvaToOffset(nva) + 2 # Skip the short "hint"
-                name = self.readAtOffset(nameoff, 256).split("\x00")[0]
+                self.imports.append((x.FirstThunk+(idx*self.psize),libname,name))
 
-                self.imports.append((ava,libname,name))
-
-                ord += 1
+                idx += 1
                 
             poff += isize
-            ibytes = self.readAtOffset(poff, isize)
-            x = vs_pe.IMAGE_IMPORT_DIRECTORY(ibytes)
+            x.vsParse(self.readAtOffset(poff, len(x)))
 
     def getRelocations(self):
         """
@@ -259,8 +317,8 @@ class PE(object):
     def parseRelocations(self):
         self.relocations = []
         edir = self.IMAGE_NT_HEADERS.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC]
-        rva = int(edir.VirtualAddress)
-        rsize = int(edir.Size)
+        rva = edir.VirtualAddress
+        rsize = edir.Size
 
         if rva == 0: # no relocations
             return
@@ -272,7 +330,10 @@ class PE(object):
             pageva, chunksize = struct.unpack("<LL", relbytes[:8])
             relcnt = (chunksize - 8) / 2
             rels = struct.unpack("<%dH" % relcnt, relbytes[8:chunksize])
-            self.relocations.extend([x+pageva for x in rels])
+            for r in rels:
+                rtype = r >> 12
+                roff  = r & 0xfff
+                self.relocations.append((pageva+roff, rtype))
             relbytes = relbytes[chunksize:]
 
     def parseExports(self):
@@ -283,26 +344,23 @@ class PE(object):
         self.IMAGE_EXPORT_DIRECTORY = None
 
         edir = self.IMAGE_NT_HEADERS.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
-        poff = self.rvaToOffset(int(edir.VirtualAddress))
+        poff = self.rvaToOffset(edir.VirtualAddress)
 
-        #FIXME should this be just VirtualAddress == 0 or Size?
         if poff == 0: # No exports...
             return
 
-        esize = vstruct.calcsize(vs_pe.IMAGE_EXPORT_DIRECTORY)
-        ebytes = self.readAtOffset(poff, esize)
-        self.IMAGE_EXPORT_DIRECTORY = vs_pe.IMAGE_EXPORT_DIRECTORY(ebytes)
+        self.IMAGE_EXPORT_DIRECTORY = self.readStructAtOffset(poff, "pe.IMAGE_EXPORT_DIRECTORY")
 
-        funcoff = self.rvaToOffset(int(self.IMAGE_EXPORT_DIRECTORY.AddressOfFunctions))
-        funcsize = 4 * int(self.IMAGE_EXPORT_DIRECTORY.NumberOfFunctions)
+        funcoff = self.rvaToOffset(self.IMAGE_EXPORT_DIRECTORY.AddressOfFunctions)
+        funcsize = 4 * self.IMAGE_EXPORT_DIRECTORY.NumberOfFunctions
         funcbytes = self.readAtOffset(funcoff, funcsize)
 
-        nameoff = self.rvaToOffset(int(self.IMAGE_EXPORT_DIRECTORY.AddressOfNames))
-        namesize = 4 * int(self.IMAGE_EXPORT_DIRECTORY.NumberOfNames)
+        nameoff = self.rvaToOffset(self.IMAGE_EXPORT_DIRECTORY.AddressOfNames)
+        namesize = 4 * self.IMAGE_EXPORT_DIRECTORY.NumberOfNames
         namebytes = self.readAtOffset(nameoff, namesize)
 
-        ordoff = self.rvaToOffset(int(self.IMAGE_EXPORT_DIRECTORY.AddressOfOrdinals))
-        ordsize = 2 * int(self.IMAGE_EXPORT_DIRECTORY.NumberOfNames)
+        ordoff = self.rvaToOffset(self.IMAGE_EXPORT_DIRECTORY.AddressOfOrdinals)
+        ordsize = 2 * self.IMAGE_EXPORT_DIRECTORY.NumberOfNames
         ordbytes = self.readAtOffset(ordoff, ordsize)
 
         funclist = struct.unpack("%dI" % (len(funcbytes) / 4), funcbytes)
@@ -314,7 +372,8 @@ class PE(object):
 
             ord = ordlist[i]
             nameoff = self.rvaToOffset(namelist[i])
-            funcoff = funclist[i]
+
+            funcoff = funclist[ord]
             ffoff = self.rvaToOffset(funcoff)
 
             name = None
@@ -324,11 +383,11 @@ class PE(object):
             else:
                 name = "ord_%.4x" % ord
 
-            if ffoff >= poff and ffoff < poff + int(edir.Size):
+            if ffoff >= poff and ffoff < poff + edir.Size:
                 fwdname = self.readAtOffset(ffoff, 260).split("\x00", 1)[0]
-                self.forwarders.append((funclist[i],name,fwdname))
+                self.forwarders.append((funclist[ord],name,fwdname))
             else:
-                self.exports.append((funclist[i], ord, name))
+                self.exports.append((funclist[ord], ord, name))
 
     def __getattr__(self, name):
         """
@@ -373,6 +432,10 @@ class PE(object):
         elif name == "relocations":
             self.parseRelocations()
             return self.relocations
+
+        elif name == "IMAGE_LOAD_CONFIG":
+            self.parseLoadConfig()
+            return self.IMAGE_LOAD_CONFIG
 
         else:
             raise AttributeError

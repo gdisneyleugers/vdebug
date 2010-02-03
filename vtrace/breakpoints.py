@@ -16,20 +16,20 @@ class Breakpoint:
     program counter and the break instruction.  As long as
     platfforms are completely implemented, all breakpoint
     objects should be portable.
-
-
     """
-    def __init__(self, address, enabled=True, expression=None):
+
+    bpcodeobj = {} # Cache compiled code objects on the class def
+
+    def __init__(self, address, expression=None):
         self.saved = None
         self.address = address
-        self.enabled = enabled
+        self.enabled = True
         self.active = False
         self.id = -1
         self.vte = None
         self.bpcode = None
-        self.bpcodeobj = None
         if expression:
-            self.vte = vtrace.VtraceExpression(expression)
+            self.vte = expression
 
     def getAddress(self):
         """
@@ -48,7 +48,11 @@ class Breakpoint:
         return "0x%.8x" % self.address
 
     def __repr__(self):
-        return "[%d] %s: %s" % (self.id, self.__class__.__name__, self.getName())
+        if self.address == None:
+            addr = "unresolved"
+        else:
+            addr = "0x%.8x" % self.address
+        return "[%d] %s %s: %s" % (self.id, addr, self.__class__.__name__, self.getName())
 
     def activate(self, trace):
         """
@@ -85,7 +89,10 @@ class Breakpoint:
         use that to resolve the address...
         """
         if self.address == None and self.vte:
-            self.address = self.vte.evaluate(trace,noraise=True)
+            try:
+                self.address = trace.parseExpression(self.vte)
+            except Exception, e:
+                self.address == None
         return self.address
 
     def isEnabled(self):
@@ -109,8 +116,8 @@ class Breakpoint:
             vtrace - the vtrace module
             bp - the breakpoint
         """
-        self.bpcodeobj = None
         self.bpcode = pystr
+        Breakpoint.bpcodeobj.pop(self.id, None)
 
     def getBreakpointCode(self):
         """
@@ -126,12 +133,15 @@ class Breakpoint:
         your override.
         """
         if self.bpcode != None:
-            if self.bpcodeobj == None:
+            cobj = Breakpoint.bpcodeobj.get(self.id, None)
+            if cobj == None:
                 fname = "BP:%d (0x%.8x)" % (self.id, self.address)
-                self.bpcodeobj = compile(self.bpcode, fname, "exec")
+                cobj = compile(self.bpcode, fname, "exec")
+                Breakpoint.bpcodeobj[self.id] = cobj
 
-            d = {"vtrace":vtrace,"trace":trace,"bp":self}
-            exec(self.bpcodeobj, d, d)
+            d = vtrace.VtraceExpressionLocals(trace)
+            d['bp'] = self
+            exec(cobj, None, d)
 
 class TrackerBreak(Breakpoint):
     """
@@ -190,15 +200,11 @@ class CallBreak(Breakpoint):
     we get garbage collected...
     """
     def __init__(self, address, saved_regs):
-        Breakpoint.__init__(self, address, True)
+        Breakpoint.__init__(self, address)
         self.endregs = None # Filled in when we get hit
         self.saved_regs = saved_regs
-        self.onehitwonder = True
 
     def notify(self, event, trace):
-        if self.onehitwonder:
-            self.onehitwonder = False
-            return
         self.endregs = trace.getRegisters()
         trace.removeBreakpoint(self.id)
         trace.setRegisters(self.saved_regs)
