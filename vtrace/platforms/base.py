@@ -286,6 +286,8 @@ class TracerBase(vtrace.Notifier):
         """
         if self.thread:
             self.thread.go = False
+            
+        self.thread.queue.put((None,None,None,None)) # FIX
 
     def __del__(self):
         if self.attached:
