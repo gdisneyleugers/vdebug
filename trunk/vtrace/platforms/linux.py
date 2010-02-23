@@ -315,9 +315,15 @@ class LinuxMixin(v_posix.PtraceMixin, v_posix.PosixMixin):
             raise Exception("ERROR ptrace failed!")
 
     def platformDetach(self):
-        libc.close(self.memfd)
+        if self.memfd != None:
+            libc.close(self.memfd)
         for tid in self.pthreads:
             tid,v_posix.ptrace(PT_DETACH, tid, 0, 0)
+    
+    def releaseMemory(self):
+        if self.memfd != None:
+            libc.close(self.memfd)
+            self.memfd = None
 
     def doAttachThread(self, tid, attached=False):
         """
