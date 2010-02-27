@@ -8,6 +8,10 @@ packages = [
     "cobra",
     "Elf",
     "envi",
+    "envi.memcanvas",
+    "envi.archs",
+    "envi.archs.i386",
+    "envi.archs.amd64",
     "envi.disassemblers",
     "envi.disassemblers.libdisassemble",
     "PE",
@@ -16,6 +20,7 @@ packages = [
     "vdb.gui",
     "vdb.gui.extensions",
     "vstruct",
+    "vstruct.defs",
     "vtrace",
     "vtrace.archs",
     "vtrace.platforms",
@@ -30,7 +35,12 @@ if sys.platform == "darwin":
     mods.append(Extension('mach', sources = ['mach/machmodule.c','mach/task.c', 'mach/thread.c', 'mach/utility.c']))
 
 # Install the dbghelp library
-pkgdata["vtrace"] = ["platforms/dbghelp.dll","platforms/symsrv.dll"]
+pkgdata["vtrace"] = [
+    "platforms/windll/amd64/dbghelp.dll",
+    "platforms/windll/amd64/symsrv.dll",
+    "platforms/windll/i386/dbghelp.dll",
+    "platforms/windll/i386/symsrv.dll",
+    ]
 pkgdata["vdb"] = ["configs/*","glade/*"]
 
 setup  (name        = 'VDB',
